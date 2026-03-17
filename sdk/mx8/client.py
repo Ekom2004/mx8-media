@@ -85,7 +85,10 @@ def default_client() -> MX8Client:
 def _normalize_transforms(transform: Transform | Sequence[Transform]) -> list[dict[str, Any]]:
     if isinstance(transform, Transform):
         return [transform.to_payload()]
-    return [item.to_payload() for item in transform]
+    payloads = [item.to_payload() for item in transform]
+    if not payloads:
+        raise ValueError("transform must contain at least one transform")
+    return payloads
 
 
 def _job_from_payload(client: MX8Client, payload: dict[str, Any]) -> Job:

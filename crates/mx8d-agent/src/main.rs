@@ -2,6 +2,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,15 +22,28 @@ use mx8_proto::v0::RegisterNodeRequest;
 use mx8_proto::v0::ReportProgressRequest;
 use mx8_proto::v0::RequestLeaseRequest;
 
+use mx8_core::types::{
+    normalize_image_format, JobSpec as CoreJobSpec, ManifestRecord, TransformSpec,
+};
 use mx8_observe::metrics::{Counter, Gauge};
-use mx8_core::types::{JobSpec as CoreJobSpec, ManifestRecord, TransformSpec};
 use mx8_wire::TryToCore;
 
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{DynamicImage, ImageFormat};
 use mx8_runtime::pipeline::{Pipeline, RuntimeCaps};
 use mx8_runtime::sink::Sink;
 use mx8_runtime::types::Batch;
+use webp_rust::ImageBuffer as WebpImageBuffer;
+use webp_rust::{encode_lossless as encode_lossless_webp, encode_lossy as encode_lossy_webp};
+
+#[cfg(feature = "s3")]
+use aws_sdk_s3::primitives::ByteStream;
 
 const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(feature = "s3")]
+type S3Client = aws_sdk_s3::Client;
 
 #[derive(Debug, Parser, Clone)]
 #[command(name = "mx8d-agent")]
@@ -227,6 +241,8 @@ struct JobSpecSink {
     cancelled: Arc<AtomicBool>,
     job_spec: Arc<CoreJobSpec>,
     source_locations: Arc<HashMap<u64, String>>,
+    #[cfg(feature = "s3")]
+    s3_client: Arc<S3Client>,
 }
 
 impl Sink for JobSpecSink {
@@ -244,12 +260,14 @@ impl Sink for JobSpecSink {
         validate_sink_uri(&self.job_spec.sink_uri)?;
 
         let mut first_output_uri: Option<String> = None;
-        for sample_id in batch.sample_ids.iter().copied() {
-            let source_location = self
-                .source_locations
-                .get(&sample_id)
-                .ok_or_else(|| anyhow::anyhow!("missing source location for sample_id={sample_id}"))?;
+        for (idx, sample_id) in batch.sample_ids.iter().copied().enumerate() {
+            let source_location = self.source_locations.get(&sample_id).ok_or_else(|| {
+                anyhow::anyhow!("missing source location for sample_id={sample_id}")
+            })?;
             let output_uri = plan_output_uri(&self.job_spec, source_location, sample_id)?;
+            let payload = sample_payload_bytes(&batch, idx)?;
+            let transformed = transform_payload_for_sink(&self.job_spec, source_location, payload)?;
+            self.write_output(&output_uri, &transformed)?;
             if first_output_uri.is_none() {
                 first_output_uri = Some(output_uri);
             }
@@ -286,11 +304,53 @@ impl Sink for JobSpecSink {
     }
 }
 
+impl JobSpecSink {
+    fn write_output(&self, output_uri: &str, payload: &[u8]) -> Result<()> {
+        #[cfg(feature = "s3")]
+        {
+            let (bucket, key) = parse_s3_uri(output_uri)?;
+            let body = ByteStream::from(payload.to_vec());
+            let client = self.s3_client.clone();
+            tokio::runtime::Handle::current().block_on(async move {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|err| anyhow::anyhow!("s3 put_object failed: {err}"))?;
+                Ok(())
+            })
+        }
+
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = (output_uri, payload);
+            anyhow::bail!("s3 sink requested but mx8d-agent was built without feature 's3'")
+        }
+    }
+}
+
 fn validate_sink_uri(sink_uri: &str) -> Result<()> {
     if !sink_uri.starts_with("s3://") {
         anyhow::bail!("unsupported sink_uri scheme (expected s3://): {sink_uri}");
     }
     Ok(())
+}
+
+#[cfg(feature = "s3")]
+fn parse_s3_uri(uri: &str) -> Result<(&str, &str)> {
+    let raw = uri
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow::anyhow!("expected s3:// uri, got {uri}"))?;
+    let (bucket, key) = raw
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("s3 uri missing object key: {uri}"))?;
+    if bucket.trim().is_empty() || key.trim().is_empty() {
+        anyhow::bail!("invalid s3 uri: {uri}");
+    }
+    Ok((bucket, key))
 }
 
 fn source_matches_job(source_uri: &str, record: &ManifestRecord) -> bool {
@@ -325,7 +385,11 @@ fn build_source_locations(
     Ok(locations)
 }
 
-fn plan_output_uri(job_spec: &CoreJobSpec, source_location: &str, sample_id: u64) -> Result<String> {
+fn plan_output_uri(
+    job_spec: &CoreJobSpec,
+    source_location: &str,
+    sample_id: u64,
+) -> Result<String> {
     validate_sink_uri(&job_spec.sink_uri)?;
     let base_name = source_basename_without_extension(source_location)
         .unwrap_or_else(|| format!("sample_{sample_id}"));
@@ -340,12 +404,165 @@ fn plan_output_uri(job_spec: &CoreJobSpec, source_location: &str, sample_id: u64
     ))
 }
 
+fn sample_payload_bytes<'a>(batch: &'a Batch, sample_index: usize) -> Result<&'a [u8]> {
+    let start = usize::try_from(*batch.offsets.get(sample_index).ok_or_else(|| {
+        anyhow::anyhow!("missing batch offset start for sample_index={sample_index}")
+    })?)
+    .map_err(|_| anyhow::anyhow!("batch offset start overflow for sample_index={sample_index}"))?;
+    let end = usize::try_from(*batch.offsets.get(sample_index + 1).ok_or_else(|| {
+        anyhow::anyhow!("missing batch offset end for sample_index={sample_index}")
+    })?)
+    .map_err(|_| anyhow::anyhow!("batch offset end overflow for sample_index={sample_index}"))?;
+    if end < start || end > batch.payload.len() {
+        anyhow::bail!(
+            "invalid batch payload bounds for sample_index={sample_index}: start={start} end={end} payload_len={}",
+            batch.payload.len()
+        );
+    }
+    Ok(&batch.payload[start..end])
+}
+
+fn transform_payload_for_sink(
+    job_spec: &CoreJobSpec,
+    source_location: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    job_spec.validate()?;
+
+    if job_spec.transforms.is_empty() {
+        return Ok(payload.to_vec());
+    }
+
+    if !job_spec.transforms.iter().all(|transform| {
+        matches!(
+            transform,
+            TransformSpec::ImageResize { .. }
+                | TransformSpec::ImageCrop { .. }
+                | TransformSpec::ImageConvert { .. }
+        )
+    }) {
+        anyhow::bail!("only image transforms are implemented in the worker right now");
+    }
+
+    let mut image = image::load_from_memory(payload)
+        .map_err(|err| anyhow::anyhow!("image decode failed for {source_location}: {err}"))?;
+
+    for transform in &job_spec.transforms {
+        match transform {
+            TransformSpec::ImageResize {
+                width,
+                height,
+                maintain_aspect,
+            } => {
+                image = if *maintain_aspect {
+                    image.resize(*width, *height, FilterType::Lanczos3)
+                } else {
+                    image.resize_exact(*width, *height, FilterType::Lanczos3)
+                };
+            }
+            TransformSpec::ImageCrop { width, height } => {
+                let current_width = image.width();
+                let current_height = image.height();
+                if *width > current_width || *height > current_height {
+                    anyhow::bail!(
+                        "image crop {}x{} exceeds current image dimensions {}x{} for {source_location}",
+                        width,
+                        height,
+                        current_width,
+                        current_height
+                    );
+                }
+                let x = (current_width - *width) / 2;
+                let y = (current_height - *height) / 2;
+                image = image.crop_imm(x, y, *width, *height);
+            }
+            TransformSpec::ImageConvert { .. } => {}
+            _ => anyhow::bail!("unsupported transform in image pipeline"),
+        }
+    }
+
+    encode_transformed_image(
+        &image,
+        output_extension(&job_spec.transforms, source_location).as_str(),
+        image_convert_quality(&job_spec.transforms),
+    )
+}
+
+fn image_convert_quality(transforms: &[TransformSpec]) -> Option<u32> {
+    transforms
+        .iter()
+        .rev()
+        .find_map(|transform| match transform {
+            TransformSpec::ImageConvert { quality, .. } => Some(*quality),
+            _ => None,
+        })
+}
+
+fn encode_transformed_image(
+    image: &DynamicImage,
+    extension: &str,
+    quality: Option<u32>,
+) -> Result<Vec<u8>> {
+    match normalized_image_extension(extension).as_str() {
+        "jpg" => encode_jpeg(image, quality.unwrap_or(85)),
+        "png" => encode_with_format(image, ImageFormat::Png),
+        "webp" => encode_webp(image, quality.unwrap_or(85)),
+        "bmp" => encode_with_format(image, ImageFormat::Bmp),
+        "tiff" => encode_with_format(image, ImageFormat::Tiff),
+        other => anyhow::bail!("unsupported image output format: {other}"),
+    }
+}
+
+fn encode_jpeg(image: &DynamicImage, quality: u32) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let quality_u8 = u8::try_from(quality.min(100))
+        .map_err(|_| anyhow::anyhow!("jpeg quality out of range: {quality}"))?;
+    let mut encoder = JpegEncoder::new_with_quality(&mut output, quality_u8);
+    encoder
+        .encode_image(image)
+        .map_err(|err| anyhow::anyhow!("jpeg encode failed: {err}"))?;
+    Ok(output)
+}
+
+fn encode_with_format(image: &DynamicImage, format: ImageFormat) -> Result<Vec<u8>> {
+    let mut cursor = Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, format)
+        .map_err(|err| anyhow::anyhow!("image encode failed: {err}"))?;
+    Ok(cursor.into_inner())
+}
+
+fn encode_webp(image: &DynamicImage, quality: u32) -> Result<Vec<u8>> {
+    let rgba = image.to_rgba8();
+    let has_alpha = rgba.chunks_exact(4).any(|pixel| pixel[3] != u8::MAX);
+    let width = usize::try_from(rgba.width())
+        .map_err(|_| anyhow::anyhow!("image width does not fit into usize"))?;
+    let height = usize::try_from(rgba.height())
+        .map_err(|_| anyhow::anyhow!("image height does not fit into usize"))?;
+    let webp_image = WebpImageBuffer {
+        width,
+        height,
+        rgba: rgba.into_raw(),
+    };
+
+    if has_alpha {
+        encode_lossless_webp(&webp_image, 4, None)
+            .map_err(|err| anyhow::anyhow!("webp lossless encode failed: {err}"))
+    } else {
+        encode_lossy_webp(&webp_image, 4, quality as usize, None)
+            .map_err(|err| anyhow::anyhow!("webp lossy encode failed: {err}"))
+    }
+}
+
 fn source_basename_without_extension(source_location: &str) -> Option<String> {
     let file_name = source_location.rsplit('/').next()?;
     if file_name.is_empty() {
         return None;
     }
-    let without_ext = file_name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(file_name);
+    let without_ext = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
     Some(without_ext.to_string())
 }
 
@@ -358,11 +575,22 @@ fn source_extension(source_location: &str) -> Option<String> {
     Some(ext.to_ascii_lowercase())
 }
 
+fn normalized_image_extension(ext: &str) -> String {
+    match ext.trim().to_ascii_lowercase().as_str() {
+        "jpeg" => "jpg".to_string(),
+        "tif" => "tiff".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn output_extension(transforms: &[TransformSpec], source_location: &str) -> String {
     match transforms.last() {
         Some(TransformSpec::VideoExtractFrames { format, .. }) => format.clone(),
         Some(TransformSpec::VideoExtractAudio { format, .. }) => format.clone(),
-        Some(TransformSpec::ImageConvert { format, .. }) => format.clone(),
+        Some(TransformSpec::ImageConvert { format, .. }) => match normalize_image_format(format) {
+            Some(normalized) => normalized.to_string(),
+            None => normalized_image_extension(format),
+        },
         Some(TransformSpec::VideoTranscode { .. }) => "mp4".to_string(),
         _ => source_extension(source_location).unwrap_or_else(|| "bin".to_string()),
     }
@@ -381,6 +609,7 @@ fn transform_tag(transforms: &[TransformSpec]) -> String {
             TransformSpec::VideoExtractFrames { .. } => "frames",
             TransformSpec::VideoExtractAudio { .. } => "extract_audio",
             TransformSpec::ImageResize { .. } => "resize",
+            TransformSpec::ImageCrop { .. } => "crop",
             TransformSpec::ImageConvert { .. } => "convert",
             TransformSpec::AudioResample { .. } => "resample",
             TransformSpec::AudioNormalize { .. } => "normalize",
@@ -631,12 +860,16 @@ async fn run_lease(
     ));
 
     let run_res = if let Some(job_spec) = job_spec {
+        #[cfg(feature = "s3")]
+        let s3_client = Arc::new(mx8_runtime::s3::client_from_env().await?);
         let sink = Arc::new(JobSpecSink {
             progress: progress.clone(),
             sleep: Duration::from_millis(args.sink_sleep_ms),
             cancelled: cancelled.clone(),
             job_spec,
             source_locations,
+            #[cfg(feature = "s3")]
+            s3_client,
         });
         pipeline.run_manifest_records(sink, records).await
     } else {
@@ -767,6 +1000,10 @@ async fn main() -> Result<()> {
             .map(TryToCore::try_to_core)
             .transpose()
             .map_err(|err| anyhow::anyhow!("invalid JobSpec from coordinator: {err}"))?;
+        if let Some(spec) = job_spec.as_ref() {
+            spec.validate()
+                .map_err(|err| anyhow::anyhow!("invalid JobSpec from coordinator: {err}"))?;
+        }
         let job_spec = job_spec.map(Arc::new);
         let heartbeat_interval_ms = std::cmp::max(1, register_resp.heartbeat_interval_ms as u64);
         let manifest_hash = register_resp.manifest_hash.clone();
@@ -1036,7 +1273,11 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{run_lease, AgentMetrics, Args, ManifestSource};
+    use super::{
+        normalized_image_extension, output_extension, run_lease, transform_payload_for_sink,
+        AgentMetrics, Args, CoreJobSpec, ManifestSource, TransformSpec,
+    };
+    use image::{DynamicImage, GenericImageView, ImageFormat};
     use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
     use mx8_proto::v0::{
         GetJobSnapshotRequest, GetJobSnapshotResponse, GetManifestRequest, GetManifestResponse,
@@ -1046,6 +1287,7 @@ mod tests {
         WorkRange,
     };
     use mx8_runtime::pipeline::{Pipeline, RuntimeCaps};
+    use std::io::Cursor;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use tokio_stream::wrappers::TcpListenerStream;
@@ -1192,6 +1434,218 @@ mod tests {
             }
         }
         best
+    }
+
+    fn image_bytes(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
+        let image = DynamicImage::new_rgb8(width, height);
+        let mut cursor = Cursor::new(Vec::new());
+        image.write_to(&mut cursor, format).expect("encode image");
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn image_resize_transform_rewrites_dimensions() {
+        let payload = image_bytes(16, 8, ImageFormat::Png);
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::ImageResize {
+                width: 4,
+                height: 4,
+                maintain_aspect: true,
+            }],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.png", payload.as_slice())
+                .expect("transform");
+        let decoded = image::load_from_memory(&transformed).expect("decode output");
+        assert_eq!(decoded.dimensions(), (4, 2));
+    }
+
+    #[test]
+    fn image_crop_transform_rewrites_dimensions() {
+        let payload = image_bytes(16, 8, ImageFormat::Png);
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::ImageCrop {
+                width: 6,
+                height: 4,
+            }],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.png", payload.as_slice())
+                .expect("transform");
+        let decoded = image::load_from_memory(&transformed).expect("decode output");
+        assert_eq!(decoded.dimensions(), (6, 4));
+    }
+
+    #[test]
+    fn image_convert_transform_rewrites_format() {
+        let payload = image_bytes(8, 8, ImageFormat::Png);
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::ImageConvert {
+                format: "jpg".to_string(),
+                quality: 80,
+            }],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.png", payload.as_slice())
+                .expect("transform");
+        assert!(transformed.starts_with(&[0xFF, 0xD8, 0xFF]));
+    }
+
+    #[test]
+    fn image_resize_preserves_bmp_output_when_source_is_bmp() {
+        let payload = image_bytes(10, 6, ImageFormat::Bmp);
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::ImageResize {
+                width: 5,
+                height: 3,
+                maintain_aspect: false,
+            }],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.bmp", payload.as_slice())
+                .expect("transform");
+        assert!(transformed.starts_with(b"BM"));
+        let decoded = image::load_from_memory(&transformed).expect("decode output");
+        assert_eq!(decoded.dimensions(), (5, 3));
+    }
+
+    #[test]
+    fn image_resize_then_convert_rewrites_dimensions_and_format() {
+        let payload = image_bytes(16, 8, ImageFormat::Png);
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![
+                TransformSpec::ImageResize {
+                    width: 4,
+                    height: 4,
+                    maintain_aspect: true,
+                },
+                TransformSpec::ImageConvert {
+                    format: "webp".to_string(),
+                    quality: 85,
+                },
+            ],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.png", payload.as_slice())
+                .expect("transform");
+        assert_eq!(&transformed[..4], b"RIFF");
+        let decoded = image::load_from_memory(&transformed).expect("decode output");
+        assert_eq!(decoded.dimensions(), (4, 2));
+    }
+
+    #[test]
+    fn image_crop_then_convert_rewrites_dimensions_and_format() {
+        let payload = image_bytes(16, 8, ImageFormat::Png);
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![
+                TransformSpec::ImageCrop {
+                    width: 8,
+                    height: 4,
+                },
+                TransformSpec::ImageConvert {
+                    format: "jpg".to_string(),
+                    quality: 80,
+                },
+            ],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.png", payload.as_slice())
+                .expect("transform");
+        assert!(transformed.starts_with(&[0xFF, 0xD8, 0xFF]));
+        let decoded = image::load_from_memory(&transformed).expect("decode output");
+        assert_eq!(decoded.dimensions(), (8, 4));
+    }
+
+    #[test]
+    fn image_convert_webp_preserves_alpha_images() {
+        let mut image = image::RgbaImage::new(4, 4);
+        image.fill(0);
+        image.put_pixel(0, 0, image::Rgba([255, 0, 0, 127]));
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut cursor, ImageFormat::Png)
+            .expect("encode png");
+        let payload = cursor.into_inner();
+
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::ImageConvert {
+                format: "webp".to_string(),
+                quality: 85,
+            }],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.png", payload.as_slice())
+                .expect("transform");
+        assert_eq!(&transformed[..4], b"RIFF");
+        let decoded = image::load_from_memory(&transformed).expect("decode output");
+        assert_eq!(decoded.to_rgba8().get_pixel(0, 0)[3], 127);
+    }
+
+    #[test]
+    fn image_crop_rejects_oversized_request() {
+        let payload = image_bytes(4, 4, ImageFormat::Png);
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::ImageCrop {
+                width: 8,
+                height: 4,
+            }],
+        };
+
+        let err = transform_payload_for_sink(&spec, "s3://in/sample.png", payload.as_slice())
+            .expect_err("expected oversized crop to fail");
+        assert!(err.to_string().contains("exceeds current image dimensions"));
+    }
+
+    #[test]
+    fn image_resize_normalizes_tif_extension_for_encoding() {
+        let extension = output_extension(
+            &[TransformSpec::ImageResize {
+                width: 8,
+                height: 8,
+                maintain_aspect: true,
+            }],
+            "s3://in/sample.tif",
+        );
+        assert_eq!(normalized_image_extension(&extension), "tiff");
     }
 
     #[test]

@@ -26,6 +26,7 @@ azure_storage_blobs = { version = "0.21", default-features = false, features = [
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 google-cloud-storage = { version = "0.22", default-features = false, features = ["auth", "rustls-tls"] }
+image = "0.25"
 prost = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,6 +36,7 @@ tokio-stream = "0.1"
 tonic = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+webp-rust = "0.1"
 
 [patch.crates-io]
 hf-hub = { path = "patches/hf-hub" }

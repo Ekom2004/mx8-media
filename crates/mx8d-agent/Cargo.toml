@@ -6,11 +6,14 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+aws-sdk-s3 = { workspace = true, optional = true }
 clap.workspace = true
+image.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+webp-rust.workspace = true
 
 mx8-observe = { path = "../mx8-observe" }
 mx8-core = { path = "../mx8-core" }
@@ -20,7 +23,7 @@ mx8-wire = { path = "../mx8-wire" }
 
 [features]
 default = []
-s3 = ["mx8-runtime/s3"]
+s3 = ["dep:aws-sdk-s3", "mx8-runtime/s3"]
 
 [dev-dependencies]
 tokio-stream = { workspace = true, features = ["net"] }

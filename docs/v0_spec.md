@@ -82,6 +82,11 @@ image.resize(width=int, height=int, maintain_aspect=True)
 Resize image files (jpg, png, webp, tiff, bmp). Maintains aspect ratio by default.
 
 ```python
+image.crop(width=int, height=int)
+```
+Center-crop image files to the target size. Fails if the crop is larger than the current image.
+
+```python
 image.convert(format="jpg" | "png" | "webp", quality=85)
 ```
 Convert image to a target format. `quality` applies to lossy formats (jpg, webp).

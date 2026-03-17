@@ -96,7 +96,7 @@ sdk/
 │   ├── job.py             # Job class with .wait(), .poll()
 │   ├── transforms/
 │   │   ├── video.py       # video.transcode(), video.resize(), etc.
-│   │   ├── image.py       # image.resize(), image.convert()
+│   │   ├── image.py       # image.resize(), image.crop(), image.convert()
 │   │   └── audio.py       # audio.resample(), audio.normalize()
 │   └── client.py          # HTTP client to talk to the API
 └── pyproject.toml
@@ -216,6 +216,7 @@ pub enum Transform {
     VideoExtractFrames { fps: f32, format: ImageFormat },
     VideoExtractAudio { format: AudioFormat, bitrate: String },
     ImageResize { width: u32, height: u32, maintain_aspect: bool },
+    ImageCrop { width: u32, height: u32 },
     ImageConvert { format: ImageFormat, quality: u8 },
     AudioResample { rate: u32, channels: u8 },
     AudioNormalize { loudness_lufs: f32 },

@@ -96,12 +96,12 @@ impl ToWire<wire::Transform> for core::TransformSpec {
         use wire::transform::Kind;
 
         let kind = match self {
-            core::TransformSpec::VideoTranscode { codec, crf } => Kind::VideoTranscode(
-                wire::VideoTranscode {
+            core::TransformSpec::VideoTranscode { codec, crf } => {
+                Kind::VideoTranscode(wire::VideoTranscode {
                     codec: codec.clone(),
                     crf: *crf,
-                },
-            ),
+                })
+            }
             core::TransformSpec::VideoResize {
                 width,
                 height,
@@ -131,6 +131,10 @@ impl ToWire<wire::Transform> for core::TransformSpec {
                 width: *width,
                 height: *height,
                 maintain_aspect: *maintain_aspect,
+            }),
+            core::TransformSpec::ImageCrop { width, height } => Kind::ImageCrop(wire::ImageCrop {
+                width: *width,
+                height: *height,
             }),
             core::TransformSpec::ImageConvert { format, quality } => {
                 Kind::ImageConvert(wire::ImageConvert {
@@ -198,6 +202,10 @@ impl TryToCore<core::TransformSpec> for wire::Transform {
                 width: spec.width,
                 height: spec.height,
                 maintain_aspect: spec.maintain_aspect,
+            }),
+            Kind::ImageCrop(spec) => Ok(core::TransformSpec::ImageCrop {
+                width: spec.width,
+                height: spec.height,
             }),
             Kind::ImageConvert(spec) => {
                 non_empty("format", &spec.format)?;
@@ -355,6 +363,10 @@ mod tests {
                     width: 512,
                     height: 512,
                     maintain_aspect: true,
+                },
+                core::TransformSpec::ImageCrop {
+                    width: 384,
+                    height: 384,
                 },
                 core::TransformSpec::ImageConvert {
                     format: "jpg".to_string(),

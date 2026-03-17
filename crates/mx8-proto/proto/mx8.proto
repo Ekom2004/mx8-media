@@ -77,6 +77,7 @@ message Transform {
     ImageConvert image_convert = 6;
     AudioResample audio_resample = 7;
     AudioNormalize audio_normalize = 8;
+    ImageCrop image_crop = 9;
   }
 }
 
@@ -110,6 +111,11 @@ message ImageResize {
 message ImageConvert {
   string format = 1;
   uint32 quality = 2;
+}
+
+message ImageCrop {
+  uint32 width = 1;
+  uint32 height = 2;
 }
 
 message AudioResample {

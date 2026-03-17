@@ -23,7 +23,9 @@ use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{info, info_span, Instrument};
 
-use mx8_core::types::{JobSpec as CoreJobSpec, ManifestHash, TransformSpec, MANIFEST_SCHEMA_VERSION};
+use mx8_core::types::{
+    JobSpec as CoreJobSpec, ManifestHash, TransformSpec, MANIFEST_SCHEMA_VERSION,
+};
 use mx8_manifest_store::ManifestStore;
 use mx8_observe::metrics::{Counter, Gauge};
 use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
@@ -267,6 +269,15 @@ fn parse_configured_job_spec(args: &Args) -> anyhow::Result<Option<ConfiguredJob
     })?;
     let transforms = serde_json::from_str::<Vec<TransformSpec>>(&transforms_json)
         .map_err(|e| anyhow::anyhow!("invalid MX8_TRANSFORMS_JSON: {e}"))?;
+    CoreJobSpec {
+        job_id: "configured-job".to_string(),
+        source_uri: source_uri.clone(),
+        sink_uri: sink_uri.clone(),
+        aws_region: aws_region.clone(),
+        transforms: transforms.clone(),
+    }
+    .validate()
+    .map_err(|err| anyhow::anyhow!("invalid configured JobSpec: {err}"))?;
 
     Ok(Some(ConfiguredJobSpec {
         source_uri,
