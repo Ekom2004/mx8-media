@@ -146,7 +146,15 @@ class PostgresJobStore:
         return self._row_to_job(row)
 
     def _ensure_schema(self) -> None:
-        with self._connect(self._schema_dsn, autocommit=True) as conn:
+        try:
+            self._ensure_schema_with_dsn(self._schema_dsn)
+        except Exception:
+            if self._schema_dsn == self._dsn:
+                raise
+            self._ensure_schema_with_dsn(self._dsn)
+
+    def _ensure_schema_with_dsn(self, dsn: str) -> None:
+        with self._connect(dsn, autocommit=True) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """

@@ -28,7 +28,7 @@ futures = "0.3"
 google-cloud-storage = { version = "0.22", default-features = false, features = ["auth", "rustls-tls"] }
 image = "0.25"
 prost = "0.12"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }

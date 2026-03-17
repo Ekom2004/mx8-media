@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -379,6 +380,12 @@ impl Sink for JobSpecSink {
 
 impl JobSpecSink {
     fn write_output(&self, output_uri: &str, payload: &[u8]) -> Result<()> {
+        if output_uri.starts_with("file://") {
+            let path = parse_file_uri(output_uri)?;
+            write_file_output(&path, payload)?;
+            return Ok(());
+        }
+
         #[cfg(feature = "s3")]
         {
             let (bucket, key) = parse_s3_uri(output_uri)?;
@@ -406,10 +413,10 @@ impl JobSpecSink {
 }
 
 fn validate_sink_uri(sink_uri: &str) -> Result<()> {
-    if !sink_uri.starts_with("s3://") {
-        anyhow::bail!("unsupported sink_uri scheme (expected s3://): {sink_uri}");
+    if sink_uri.starts_with("s3://") || sink_uri.starts_with("file://") {
+        return Ok(());
     }
-    Ok(())
+    anyhow::bail!("unsupported sink_uri scheme (expected s3:// or file://): {sink_uri}");
 }
 
 #[cfg(feature = "s3")]
@@ -426,7 +433,41 @@ fn parse_s3_uri(uri: &str) -> Result<(&str, &str)> {
     Ok((bucket, key))
 }
 
+fn parse_file_uri(uri: &str) -> Result<PathBuf> {
+    let raw = uri
+        .strip_prefix("file://")
+        .ok_or_else(|| anyhow::anyhow!("expected file:// uri, got {uri}"))?;
+    if raw.trim().is_empty() {
+        anyhow::bail!("file uri missing path: {uri}");
+    }
+    Ok(PathBuf::from(raw))
+}
+
+fn write_file_output(path: &Path, payload: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            anyhow::anyhow!(
+                "failed to create output directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(path, payload)
+        .map_err(|err| anyhow::anyhow!("failed to write output file {}: {err}", path.display()))
+}
+
 fn source_matches_job(source_uri: &str, record: &ManifestRecord) -> bool {
+    if let Some(source_path) = local_source_path(source_uri) {
+        if let Some(record_path) = local_source_path(&record.location) {
+            let source_is_dir = source_uri.ends_with('/');
+            return if source_is_dir {
+                record_path.starts_with(&source_path)
+            } else {
+                record_path == source_path
+            };
+        }
+    }
+
     let normalized = source_uri.trim_end_matches('/');
     if normalized.is_empty() {
         return true;
@@ -436,6 +477,17 @@ fn source_matches_job(source_uri: &str, record: &ManifestRecord) -> bool {
     } else {
         record.location == normalized
     }
+}
+
+fn local_source_path(location: &str) -> Option<PathBuf> {
+    let path = if let Some(raw) = location.strip_prefix("file://") {
+        PathBuf::from(raw)
+    } else if location.starts_with('/') {
+        PathBuf::from(location)
+    } else {
+        return None;
+    };
+    std::fs::canonicalize(path).ok()
 }
 
 fn build_source_locations(

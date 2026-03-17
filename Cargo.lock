@@ -2582,6 +2582,7 @@ dependencies = [
  "mx8-proto",
  "mx8-snapshot",
  "mx8-wire",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

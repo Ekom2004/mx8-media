@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,9 +45,24 @@ static HA_APPLIED_TERM: AtomicU64 = AtomicU64::new(0);
 static STATE_STORE: OnceLock<Arc<state_store::FileCoordinatorStore>> = OnceLock::new();
 static JOB_SPEC_TEMPLATE: OnceLock<Option<ConfiguredJobSpec>> = OnceLock::new();
 
+#[derive(Debug, serde::Serialize)]
+struct JobStatusWebhook<'a> {
+    status: &'a str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct JobCompleteWebhook<'a> {
+    job_id: &'a str,
+    total_bytes_processed: u64,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "mx8-coordinator")]
 struct Args {
+    /// Logical job id used for coordinator webhooks and agent metadata.
+    #[arg(long, env = "MX8_JOB_ID", default_value = "local-job")]
+    job_id: String,
+
     /// Address to bind the coordinator gRPC server.
     #[arg(long, env = "MX8_COORD_BIND_ADDR", default_value = "0.0.0.0:50051")]
     addr: SocketAddr,
@@ -221,6 +236,10 @@ struct Args {
     /// JSON array of transform specs included in the JobSpec returned to agents.
     #[arg(long, env = "MX8_TRANSFORMS_JSON")]
     transforms_json: Option<String>,
+
+    /// Base URL for the API that receives job status webhooks.
+    #[arg(long, env = "MX8_API_BASE_URL")]
+    api_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -240,6 +259,69 @@ impl ConfiguredJobSpec {
             aws_region: self.aws_region.clone(),
             transforms: self.transforms.clone(),
         }
+    }
+}
+
+#[derive(Debug)]
+struct JobStatusNotifier {
+    client: reqwest::Client,
+    job_id: String,
+    api_base_url: String,
+    running_sent: AtomicBool,
+    complete_sent: AtomicBool,
+}
+
+impl JobStatusNotifier {
+    fn new(job_id: String, api_base_url: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            job_id,
+            api_base_url: api_base_url.trim_end_matches('/').to_string(),
+            running_sent: AtomicBool::new(false),
+            complete_sent: AtomicBool::new(false),
+        }
+    }
+
+    fn notify_running(self: &Arc<Self>) {
+        if self.running_sent.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let notifier = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(err) = notifier
+                .client
+                .post(format!(
+                    "{}/internal/job-status/{}",
+                    notifier.api_base_url, notifier.job_id
+                ))
+                .json(&JobStatusWebhook { status: "RUNNING" })
+                .send()
+                .await
+            {
+                tracing::warn!(error = %err, job_id = %notifier.job_id, "failed to notify API that job is RUNNING");
+            }
+        });
+    }
+
+    fn notify_complete(self: &Arc<Self>) {
+        if self.complete_sent.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let notifier = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(err) = notifier
+                .client
+                .post(format!("{}/internal/job-complete", notifier.api_base_url))
+                .json(&JobCompleteWebhook {
+                    job_id: &notifier.job_id,
+                    total_bytes_processed: 0,
+                })
+                .send()
+                .await
+            {
+                tracing::warn!(error = %err, job_id = %notifier.job_id, "failed to notify API that job is COMPLETE");
+            }
+        });
     }
 }
 
@@ -603,6 +685,7 @@ struct CoordinatorSvc {
     manifest_store: Option<Arc<dyn ManifestStore>>,
     /// Write-ahead log for completed lease ranges; `None` in dev/test mode.
     lease_log: Option<Arc<Mutex<lease_log::LeaseLog>>>,
+    job_status_notifier: Option<Arc<JobStatusNotifier>>,
 }
 
 fn existing_caps_changed(existing: &Option<NodeCaps>, new: &Option<NodeCaps>) -> bool {
@@ -1646,6 +1729,9 @@ impl CoordinatorSvc {
                 unix_time_ms = now,
                 "job drained"
             );
+            if let Some(notifier) = self.job_status_notifier.as_ref() {
+                notifier.notify_complete();
+            }
         }
 
         self.update_gauges().await;
@@ -2216,6 +2302,9 @@ impl Coordinator for CoordinatorSvc {
                     );
                 }
             }
+            if let Some(notifier) = self.job_status_notifier.as_ref() {
+                notifier.notify_running();
+            }
             self.update_gauges().await;
             self.persist_state_store_snapshot().await?;
             return Ok(Response::new(ReportProgressResponse {}));
@@ -2263,6 +2352,9 @@ impl Coordinator for CoordinatorSvc {
             unix_time_ms = req.unix_time_ms,
             "progress accepted"
         );
+        if let Some(notifier) = self.job_status_notifier.as_ref() {
+            notifier.notify_running();
+        }
         self.persist_state_store_snapshot().await?;
         Ok(Response::new(ReportProgressResponse {}))
     }
@@ -2616,6 +2708,10 @@ async fn main() -> Result<()> {
                 "configured JobSpec template for agent registration"
             );
         }
+        let job_status_notifier = args
+            .api_base_url
+            .as_ref()
+            .map(|base_url| Arc::new(JobStatusNotifier::new(args.job_id.clone(), base_url.clone())));
 
         let svc = CoordinatorSvc {
             state: Arc::new(RwLock::new(CoordinatorState {
@@ -2645,6 +2741,7 @@ async fn main() -> Result<()> {
             manifest_hash: resolved_manifest_hash,
             manifest_store: Some(store.clone()),
             lease_log: lease_log_arc,
+            job_status_notifier,
         };
 
         svc.bootstrap_from_state_store().await?;
@@ -2715,6 +2812,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         let err = svc
@@ -2744,6 +2842,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         let node2_first = svc
@@ -2799,6 +2898,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {
@@ -2843,6 +2943,7 @@ mod tests {
             manifest_hash: "h".to_string(),
             manifest_store: Some(store),
             lease_log: None,
+            job_status_notifier: None,
         };
 
         let resp = svc
@@ -2886,6 +2987,7 @@ mod tests {
             manifest_hash: "h".to_string(),
             manifest_store: Some(store),
             lease_log: None,
+            job_status_notifier: None,
         };
 
         let resp = svc
@@ -2950,6 +3052,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {
@@ -3048,6 +3151,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {
@@ -3131,6 +3235,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {
@@ -3246,6 +3351,7 @@ mod tests {
                 manifest_hash: "testhash".to_string(),
                 manifest_store: None,
                 lease_log: Some(log_arc),
+                job_status_notifier: None,
             };
 
             svc.register_node(Request::new(RegisterNodeRequest {
@@ -3362,6 +3468,7 @@ mod tests {
                 manifest_hash: "testhash".to_string(),
                 manifest_store: None,
                 lease_log: Some(log_arc),
+                job_status_notifier: None,
             };
 
             svc.register_node(Request::new(RegisterNodeRequest {
@@ -3473,6 +3580,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         let resume = DistributedResumeToken {
@@ -3546,6 +3654,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         let err = svc
@@ -3598,6 +3707,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {
@@ -3686,6 +3796,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         // Original node registers → barrier met → frozen at rank 0.
@@ -3779,6 +3890,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         // node-a fills the only slot.
@@ -3846,6 +3958,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         let first = svc
@@ -3952,6 +4065,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {
@@ -4033,6 +4147,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         // Only 1 node registers (< world_size=2) but >= min_world_size=1.
@@ -4080,6 +4195,7 @@ mod tests {
             manifest_hash: "dev".to_string(),
             manifest_store: None,
             lease_log: None,
+            job_status_notifier: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {

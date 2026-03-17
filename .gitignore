@@ -1,3 +1,4 @@
 /target
+.mx8-media/
 __pycache__/
 *.pyc
