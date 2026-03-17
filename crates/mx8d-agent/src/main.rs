@@ -2,12 +2,11 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::collections::HashMap;
-use std::fs;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -45,38 +44,53 @@ use webp_rust::{encode_lossless as encode_lossless_webp, encode_lossy as encode_
 use aws_sdk_s3::primitives::ByteStream;
 
 const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-static TRANSFORM_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "s3")]
 type S3Client = aws_sdk_s3::Client;
 
 #[derive(Debug)]
-struct TransformTempDir {
-    path: PathBuf,
+struct TransformProcessLimiter {
+    max: usize,
+    state: Mutex<usize>,
+    cv: Condvar,
 }
 
-impl TransformTempDir {
-    fn new(kind: &str) -> Result<Self> {
-        let suffix = TRANSFORM_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "mx8-media-{kind}-{}-{}-{suffix}",
-            std::process::id(),
-            mx8_observe::time::unix_time_ms()
-        ));
-        fs::create_dir_all(&path).map_err(|err| {
-            anyhow::anyhow!("failed to create temp dir {}: {err}", path.display())
-        })?;
-        Ok(Self { path })
+impl TransformProcessLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            max: std::cmp::max(1, max),
+            state: Mutex::new(0),
+            cv: Condvar::new(),
+        }
     }
 
-    fn path(&self) -> &Path {
-        &self.path
+    fn acquire(&self) -> Result<TransformProcessPermit<'_>> {
+        let mut active = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transform limiter lock poisoned"))?;
+        while *active >= self.max {
+            active = self
+                .cv
+                .wait(active)
+                .map_err(|_| anyhow::anyhow!("transform limiter wait poisoned"))?;
+        }
+        *active += 1;
+        Ok(TransformProcessPermit { limiter: self })
     }
 }
 
-impl Drop for TransformTempDir {
+#[derive(Debug)]
+struct TransformProcessPermit<'a> {
+    limiter: &'a TransformProcessLimiter,
+}
+
+impl Drop for TransformProcessPermit<'_> {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if let Ok(mut active) = self.limiter.state.lock() {
+            *active = active.saturating_sub(1);
+            self.limiter.cv.notify_one();
+        }
     }
 }
 
@@ -130,6 +144,10 @@ struct Args {
     /// How often to report progress while executing a lease.
     #[arg(long, env = "MX8_PROGRESS_INTERVAL_MS", default_value_t = 500)]
     progress_interval_ms: u64,
+
+    /// Max concurrent ffmpeg/media transform subprocesses within this agent.
+    #[arg(long, env = "MX8_MAX_TRANSFORM_PROCESSES", default_value_t = 4)]
+    max_transform_processes: usize,
 
     /// gRPC max message size (both decode/encode) for manifest proxying and future APIs.
     #[arg(
@@ -276,6 +294,7 @@ struct JobSpecSink {
     cancelled: Arc<AtomicBool>,
     job_spec: Arc<CoreJobSpec>,
     source_locations: Arc<HashMap<u64, String>>,
+    transform_slots: Arc<TransformProcessLimiter>,
     #[cfg(feature = "s3")]
     s3_client: Arc<S3Client>,
 }
@@ -306,8 +325,13 @@ impl Sink for JobSpecSink {
                 anyhow::anyhow!("missing source location for sample_id={sample_id}")
             })?;
             let payload = sample_payload_bytes(&batch, idx)?;
-            let artifacts =
-                render_outputs_for_sink(&self.job_spec, source_location, sample_id, payload)?;
+            let artifacts = render_outputs_for_sink(
+                &self.job_spec,
+                source_location,
+                sample_id,
+                payload,
+                Some(&self.transform_slots),
+            )?;
             for artifact in artifacts {
                 self.write_output(&artifact.output_uri, &artifact.payload)?;
                 if first_output_uri.is_none() {
@@ -484,10 +508,20 @@ fn sample_payload_bytes<'a>(batch: &'a Batch, sample_index: usize) -> Result<&'a
     Ok(&batch.payload[start..end])
 }
 
+#[cfg(test)]
 fn transform_payload_for_sink(
     job_spec: &CoreJobSpec,
     source_location: &str,
     payload: &[u8],
+) -> Result<Vec<u8>> {
+    transform_payload_for_sink_with_slots(job_spec, source_location, payload, None)
+}
+
+fn transform_payload_for_sink_with_slots(
+    job_spec: &CoreJobSpec,
+    source_location: &str,
+    payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<u8>> {
     job_spec.validate()?;
 
@@ -500,7 +534,12 @@ fn transform_payload_for_sink(
     }
 
     if job_spec.transforms.iter().all(is_video_transform) {
-        return transform_video_payload_for_sink(job_spec, source_location, payload);
+        return transform_video_payload_for_sink(
+            job_spec,
+            source_location,
+            payload,
+            transform_slots,
+        );
     }
 
     anyhow::bail!(
@@ -513,6 +552,7 @@ fn render_outputs_for_sink(
     source_location: &str,
     sample_id: u64,
     payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<SinkArtifact>> {
     job_spec.validate()?;
 
@@ -524,11 +564,18 @@ fn render_outputs_for_sink(
         {
             anyhow::bail!("video.extract_frames must run as a standalone transform");
         }
-        return extract_frame_outputs_for_sink(job_spec, source_location, sample_id, payload);
+        return extract_frame_outputs_for_sink(
+            job_spec,
+            source_location,
+            sample_id,
+            payload,
+            transform_slots,
+        );
     }
 
     let output_uri = plan_output_uri(job_spec, source_location, sample_id)?;
-    let transformed = transform_payload_for_sink(job_spec, source_location, payload)?;
+    let transformed =
+        transform_payload_for_sink_with_slots(job_spec, source_location, payload, transform_slots)?;
     Ok(vec![SinkArtifact {
         output_uri,
         payload: transformed,
@@ -607,32 +654,22 @@ fn transform_video_payload_for_sink(
     job_spec: &CoreJobSpec,
     source_location: &str,
     payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<u8>> {
     if video_extract_audio_spec(&job_spec.transforms).is_some() {
         if job_spec.transforms.len() != 1 {
             anyhow::bail!("video.extract_audio must run as a standalone transform");
         }
-        return extract_audio_payload_for_sink(job_spec, source_location, payload);
+        return extract_audio_payload_for_sink(job_spec, source_location, payload, transform_slots);
     }
-
-    let temp_dir = TransformTempDir::new("video")?;
-    let input_extension = source_extension(source_location).unwrap_or_else(|| "mp4".to_string());
-    let input_path = temp_dir.path().join(format!("input.{input_extension}"));
-    let output_extension = output_extension(&job_spec.transforms, source_location);
-    let output_path = temp_dir.path().join(format!("output.{output_extension}"));
-
-    fs::write(&input_path, payload).map_err(|err| {
-        anyhow::anyhow!("failed to write video temp input for {source_location}: {err}")
-    })?;
 
     let mut command = Command::new("ffmpeg");
     command
-        .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
         .arg("-i")
-        .arg(&input_path);
+        .arg("pipe:0");
 
     if let Some(filter_chain) = video_filter_chain(&job_spec.transforms) {
         command.arg("-vf").arg(filter_chain);
@@ -649,32 +686,25 @@ fn transform_video_payload_for_sink(
         .arg("-c:a")
         .arg("copy")
         .arg("-movflags")
-        .arg("+faststart")
-        .arg(&output_path);
+        .arg("frag_keyframe+empty_moov")
+        .arg("-f")
+        .arg("mp4")
+        .arg("pipe:1");
 
-    let output = command.output().map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => {
-            anyhow::anyhow!("ffmpeg is required for video transforms but was not found in PATH")
-        }
-        _ => anyhow::anyhow!("ffmpeg invocation failed for {source_location}: {err}"),
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "ffmpeg video transform failed for {source_location}: {}",
-            stderr.trim()
-        );
-    }
-
-    fs::read(&output_path).map_err(|err| {
-        anyhow::anyhow!("failed to read video transform output for {source_location}: {err}")
-    })
+    run_ffmpeg_stdout(
+        command,
+        payload,
+        source_location,
+        "video transform",
+        transform_slots,
+    )
 }
 
 fn extract_audio_payload_for_sink(
     job_spec: &CoreJobSpec,
     source_location: &str,
     payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<u8>> {
     let (format, bitrate) = match video_extract_audio_spec(&job_spec.transforms) {
         Some(TransformSpec::VideoExtractAudio { format, bitrate }) => {
@@ -682,24 +712,14 @@ fn extract_audio_payload_for_sink(
         }
         _ => anyhow::bail!("missing video.extract_audio transform"),
     };
-    let temp_dir = TransformTempDir::new("video-audio")?;
-    let input_extension = source_extension(source_location).unwrap_or_else(|| "mp4".to_string());
-    let input_path = temp_dir.path().join(format!("input.{input_extension}"));
-    let output_extension = output_extension(&job_spec.transforms, source_location);
-    let output_path = temp_dir.path().join(format!("output.{output_extension}"));
-
-    fs::write(&input_path, payload).map_err(|err| {
-        anyhow::anyhow!("failed to write video temp input for {source_location}: {err}")
-    })?;
 
     let mut command = Command::new("ffmpeg");
     command
-        .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
         .arg("-i")
-        .arg(&input_path)
+        .arg("pipe:0")
         .arg("-vn");
 
     let codec = ffmpeg_audio_codec(format)?;
@@ -707,25 +727,18 @@ fn extract_audio_payload_for_sink(
     if normalize_audio_format(format) == Some("mp3") {
         command.arg("-b:a").arg(bitrate);
     }
-    command.arg(&output_path);
+    command
+        .arg("-f")
+        .arg(audio_output_muxer(format))
+        .arg("pipe:1");
 
-    let output = command.output().map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => {
-            anyhow::anyhow!("ffmpeg is required for video transforms but was not found in PATH")
-        }
-        _ => anyhow::anyhow!("ffmpeg invocation failed for {source_location}: {err}"),
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "ffmpeg audio extract failed for {source_location}: {}",
-            stderr.trim()
-        );
-    }
-
-    fs::read(&output_path).map_err(|err| {
-        anyhow::anyhow!("failed to read audio extract output for {source_location}: {err}")
-    })
+    run_ffmpeg_stdout(
+        command,
+        payload,
+        source_location,
+        "audio extract",
+        transform_slots,
+    )
 }
 
 fn extract_frame_outputs_for_sink(
@@ -733,77 +746,50 @@ fn extract_frame_outputs_for_sink(
     source_location: &str,
     sample_id: u64,
     payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<SinkArtifact>> {
     let (fps, format) = match video_extract_frames_spec(&job_spec.transforms) {
         Some(TransformSpec::VideoExtractFrames { fps, format }) => (*fps, format.as_str()),
         _ => anyhow::bail!("missing video.extract_frames transform"),
     };
-
-    let temp_dir = TransformTempDir::new("video-frames")?;
-    let input_extension = source_extension(source_location).unwrap_or_else(|| "mp4".to_string());
-    let input_path = temp_dir.path().join(format!("input.{input_extension}"));
     let frame_extension = output_extension(&job_spec.transforms, source_location);
-    let output_pattern = temp_dir
-        .path()
-        .join(format!("frame_%06d.{frame_extension}"));
-
-    fs::write(&input_path, payload).map_err(|err| {
-        anyhow::anyhow!("failed to write video temp input for {source_location}: {err}")
-    })?;
 
     let mut command = Command::new("ffmpeg");
     command
-        .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
         .arg("-i")
-        .arg(&input_path)
+        .arg("pipe:0")
         .arg("-vf")
         .arg(format!("fps={fps}"));
     if normalize_frame_format(format) == Some("jpg") {
         command.arg("-q:v").arg("2");
     }
-    command.arg(&output_pattern);
+    command
+        .arg("-f")
+        .arg("image2pipe")
+        .arg("-vcodec")
+        .arg(frame_pipe_codec(format)?)
+        .arg("pipe:1");
 
-    let output = command.output().map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => {
-            anyhow::anyhow!("ffmpeg is required for video transforms but was not found in PATH")
-        }
-        _ => anyhow::anyhow!("ffmpeg invocation failed for {source_location}: {err}"),
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "ffmpeg frame extract failed for {source_location}: {}",
-            stderr.trim()
-        );
-    }
-
-    let mut frame_paths = fs::read_dir(temp_dir.path())
-        .map_err(|err| anyhow::anyhow!("failed to read frame temp dir: {err}"))?
-        .filter_map(|entry| entry.ok().map(|item| item.path()))
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.starts_with("frame_"))
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    frame_paths.sort();
-
-    if frame_paths.is_empty() {
+    let output = run_ffmpeg_stdout(
+        command,
+        payload,
+        source_location,
+        "frame extract",
+        transform_slots,
+    )?;
+    let frames = split_frame_stream(&output, &frame_extension)?;
+    if frames.is_empty() {
         anyhow::bail!("ffmpeg frame extract produced no outputs for {source_location}");
     }
 
-    frame_paths
+    frames
         .into_iter()
         .enumerate()
-        .map(|(index, path)| {
+        .map(|(index, payload)| {
             let output_uri = plan_frame_output_uri(job_spec, source_location, sample_id, index)?;
-            let payload = fs::read(&path).map_err(|err| {
-                anyhow::anyhow!("failed to read extracted frame {}: {err}", path.display())
-            })?;
             Ok(SinkArtifact {
                 output_uri,
                 payload,
@@ -887,6 +873,150 @@ fn ffmpeg_audio_codec(format: &str) -> Result<&'static str> {
         Some(other) => anyhow::bail!("unsupported audio format: {other}"),
         None => anyhow::bail!("unsupported audio format: {format}"),
     }
+}
+
+fn audio_output_muxer(format: &str) -> &'static str {
+    match normalize_audio_format(format) {
+        Some("mp3") => "mp3",
+        Some("wav") => "wav",
+        Some("flac") => "flac",
+        _ => "data",
+    }
+}
+
+fn frame_pipe_codec(format: &str) -> Result<&'static str> {
+    match normalize_frame_format(format) {
+        Some("jpg") => Ok("mjpeg"),
+        Some("png") => Ok("png"),
+        Some(other) => anyhow::bail!("unsupported frame format: {other}"),
+        None => anyhow::bail!("unsupported frame format: {format}"),
+    }
+}
+
+fn run_ffmpeg_stdout(
+    mut command: Command,
+    input: &[u8],
+    source_location: &str,
+    op_name: &str,
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
+) -> Result<Vec<u8>> {
+    let _permit = transform_slots.map(|slots| slots.acquire()).transpose()?;
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            anyhow::anyhow!("ffmpeg is required for {op_name} but was not found in PATH")
+        }
+        _ => anyhow::anyhow!("ffmpeg invocation failed for {source_location}: {err}"),
+    })?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open ffmpeg stdin for {source_location}"))?;
+    let input_owned = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input_owned));
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| anyhow::anyhow!("ffmpeg wait failed for {source_location}: {err}"))?;
+    let write_result = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("ffmpeg stdin writer panicked for {source_location}"))?;
+    write_result
+        .map_err(|err| anyhow::anyhow!("ffmpeg stdin write failed for {source_location}: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ffmpeg {op_name} failed for {source_location}: {}",
+            stderr.trim()
+        );
+    }
+
+    Ok(output.stdout)
+}
+
+fn split_frame_stream(bytes: &[u8], extension: &str) -> Result<Vec<Vec<u8>>> {
+    match normalize_frame_format(extension) {
+        Some("png") => split_png_stream(bytes),
+        Some("jpg") => split_jpeg_stream(bytes),
+        Some(other) => anyhow::bail!("unsupported frame format: {other}"),
+        None => anyhow::bail!("unsupported frame format: {extension}"),
+    }
+}
+
+fn split_png_stream(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    let mut frames = Vec::new();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if index + PNG_SIGNATURE.len() > bytes.len()
+            || &bytes[index..index + PNG_SIGNATURE.len()] != PNG_SIGNATURE
+        {
+            anyhow::bail!("invalid PNG frame stream");
+        }
+        let frame_start = index;
+        index += PNG_SIGNATURE.len();
+
+        loop {
+            if index + 8 > bytes.len() {
+                anyhow::bail!("truncated PNG frame stream");
+            }
+            let length = u32::from_be_bytes(bytes[index..index + 4].try_into().expect("png length"))
+                as usize;
+            let chunk_type = &bytes[index + 4..index + 8];
+            let chunk_end = index
+                .checked_add(12 + length)
+                .ok_or_else(|| anyhow::anyhow!("PNG chunk length overflow"))?;
+            if chunk_end > bytes.len() {
+                anyhow::bail!("truncated PNG chunk in frame stream");
+            }
+            index = chunk_end;
+            if chunk_type == b"IEND" {
+                frames.push(bytes[frame_start..index].to_vec());
+                break;
+            }
+        }
+    }
+
+    Ok(frames)
+}
+
+fn split_jpeg_stream(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut frames = Vec::new();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        if index + 1 >= bytes.len() || bytes[index] != 0xFF || bytes[index + 1] != 0xD8 {
+            anyhow::bail!("invalid JPEG frame stream");
+        }
+        let frame_start = index;
+        index += 2;
+        while index + 1 < bytes.len() {
+            if bytes[index] == 0xFF && bytes[index + 1] == 0xD9 {
+                index += 2;
+                frames.push(bytes[frame_start..index].to_vec());
+                break;
+            }
+            index += 1;
+        }
+        if frames.is_empty() || frames.last().map(|frame| frame.len()).unwrap_or(0) == 0 {
+            anyhow::bail!("truncated JPEG frame stream");
+        }
+    }
+
+    Ok(frames)
 }
 
 fn image_convert_quality(transforms: &[TransformSpec]) -> Option<u32> {
@@ -1212,6 +1342,7 @@ async fn run_lease(
     metrics: &Arc<AgentMetrics>,
     lease: Lease,
     job_spec: Option<Arc<CoreJobSpec>>,
+    transform_slots: Arc<TransformProcessLimiter>,
 ) -> Result<()> {
     let Some(range) = &lease.range else {
         anyhow::bail!("lease missing range");
@@ -1271,6 +1402,7 @@ async fn run_lease(
             cancelled: cancelled.clone(),
             job_spec,
             source_locations,
+            transform_slots,
             #[cfg(feature = "s3")]
             s3_client,
         });
@@ -1515,6 +1647,7 @@ async fn main() -> Result<()> {
             let manifest_hash_clone = manifest_hash.clone();
             let manifest_source = manifest_source.clone();
             let job_spec = job_spec.clone();
+            let transform_slots = Arc::new(TransformProcessLimiter::new(args.max_transform_processes));
             tokio::spawn(async move {
                 let want = std::cmp::max(1, args_clone.dev_lease_want);
                 let grpc_max = args_clone.grpc_max_message_bytes;
@@ -1579,6 +1712,7 @@ async fn main() -> Result<()> {
                             let ch = lease_channel.clone();
                             let lease_id = lease.lease_id.clone();
                             let job_spec = job_spec.clone();
+                            let transform_slots = transform_slots.clone();
 
                             tracing::info!(
                                 target: "mx8_proof",
@@ -1600,6 +1734,7 @@ async fn main() -> Result<()> {
                                     &metrics,
                                     lease,
                                     job_spec,
+                                    transform_slots,
                                 )
                                 .await;
                                 (lease_id, res)
@@ -1678,7 +1813,8 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         normalized_image_extension, output_extension, render_outputs_for_sink, run_lease,
-        transform_payload_for_sink, AgentMetrics, Args, CoreJobSpec, ManifestSource, TransformSpec,
+        transform_payload_for_sink, AgentMetrics, Args, CoreJobSpec, ManifestSource,
+        TransformProcessLimiter, TransformSpec,
     };
     use image::{DynamicImage, GenericImageView, ImageFormat};
     use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
@@ -1811,6 +1947,7 @@ mod tests {
             max_process_rss_bytes: None,
             sink_sleep_ms: 0,
             progress_interval_ms: 60_000,
+            max_transform_processes: 1,
             grpc_max_message_bytes: 64 * 1024 * 1024,
         }
     }
@@ -2340,8 +2477,9 @@ mod tests {
             }],
         };
 
-        let artifacts = render_outputs_for_sink(&spec, "s3://in/sample.mp4", 7, payload.as_slice())
-            .expect("render outputs");
+        let artifacts =
+            render_outputs_for_sink(&spec, "s3://in/sample.mp4", 7, payload.as_slice(), None)
+                .expect("render outputs");
         assert_eq!(artifacts.len(), 4);
         assert_eq!(artifacts[0].output_uri, "s3://out/sample_frames_000000.png");
         assert!(artifacts
@@ -2382,7 +2520,7 @@ mod tests {
             ],
         };
 
-        let err = render_outputs_for_sink(&spec, "s3://in/sample.mp4", 9, payload.as_slice())
+        let err = render_outputs_for_sink(&spec, "s3://in/sample.mp4", 9, payload.as_slice(), None)
             .expect_err("expected extract_frames chaining to fail");
         assert!(err.to_string().contains("standalone transform"));
 
@@ -2550,6 +2688,7 @@ mod tests {
             &metrics,
             stream_lease,
             None,
+            Arc::new(TransformProcessLimiter::new(1)),
         )
         .await?;
 
