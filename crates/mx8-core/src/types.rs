@@ -279,6 +279,8 @@ pub struct ManifestRecord {
     pub byte_offset: Option<u64>,
     pub byte_length: Option<u64>,
     pub decode_hint: Option<String>,
+    pub segment_start_ms: Option<u64>,
+    pub segment_end_ms: Option<u64>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -289,6 +291,10 @@ pub enum ManifestRecordError {
     PartialByteRange,
     #[error("byte_length must be > 0 when byte range is specified")]
     NonPositiveByteLength,
+    #[error("segment_start_ms and segment_end_ms must be set together (both Some or both None)")]
+    PartialSegmentRange,
+    #[error("segment_end_ms must be > segment_start_ms when segment range is specified")]
+    NonPositiveSegmentDuration,
 }
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -342,14 +348,24 @@ impl ManifestRecord {
         }
 
         match (self.byte_offset, self.byte_length) {
-            (None, None) => Ok(()),
+            (None, None) => {}
             (Some(_), Some(len)) => {
                 if len == 0 {
                     return Err(ManifestRecordError::NonPositiveByteLength);
                 }
+            }
+            _ => return Err(ManifestRecordError::PartialByteRange),
+        }
+
+        match (self.segment_start_ms, self.segment_end_ms) {
+            (None, None) => Ok(()),
+            (Some(start_ms), Some(end_ms)) => {
+                if end_ms <= start_ms {
+                    return Err(ManifestRecordError::NonPositiveSegmentDuration);
+                }
                 Ok(())
             }
-            _ => Err(ManifestRecordError::PartialByteRange),
+            _ => Err(ManifestRecordError::PartialSegmentRange),
         }
     }
 }

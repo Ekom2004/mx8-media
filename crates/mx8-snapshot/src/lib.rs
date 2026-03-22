@@ -208,6 +208,8 @@ struct RemoteResolveRecord {
     byte_offset: Option<u64>,
     byte_length: Option<u64>,
     decode_hint: Option<String>,
+    segment_start_ms: Option<u64>,
+    segment_end_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +353,8 @@ fn indexed_manifest_from_remote_response(
                 byte_offset: raw.byte_offset,
                 byte_length: raw.byte_length,
                 decode_hint: raw.decode_hint,
+                segment_start_ms: raw.segment_start_ms,
+                segment_end_ms: raw.segment_end_ms,
             };
             record
                 .validate()
@@ -729,6 +733,8 @@ impl SourceResolver for HfSourceResolver {
                 byte_offset: None,
                 byte_length: None,
                 decode_hint: None,
+                segment_start_ms: None,
+                segment_end_ms: None,
             };
             record
                 .validate()
@@ -984,9 +990,9 @@ fn parse_canonical_manifest_tsv_bytes(
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() != 5 {
+        if cols.len() != 5 && cols.len() != 7 {
             return Err(SnapshotError::IndexParse(format!(
-                "line {}: expected 5 columns (sample_id<TAB>location<TAB>byte_offset<TAB>byte_length<TAB>decode_hint)",
+                "line {}: expected 5 or 7 columns (sample_id<TAB>location<TAB>byte_offset<TAB>byte_length<TAB>decode_hint[<TAB>segment_start_ms<TAB>segment_end_ms])",
                 line_no + 2
             )));
         }
@@ -1019,6 +1025,18 @@ fn parse_canonical_manifest_tsv_bytes(
         } else {
             Some(cols[4].trim().to_string())
         };
+        let mut segment_start_ms: Option<u64> = None;
+        let mut segment_end_ms: Option<u64> = None;
+        if cols.len() == 7 {
+            if !cols[5].trim().is_empty() || !cols[6].trim().is_empty() {
+                segment_start_ms = Some(cols[5].trim().parse().map_err(|_| {
+                    SnapshotError::IndexParse(format!("line {}: bad segment_start_ms", line_no + 2))
+                })?);
+                segment_end_ms = Some(cols[6].trim().parse().map_err(|_| {
+                    SnapshotError::IndexParse(format!("line {}: bad segment_end_ms", line_no + 2))
+                })?);
+            }
+        }
 
         let record = ManifestRecord {
             sample_id,
@@ -1026,6 +1044,8 @@ fn parse_canonical_manifest_tsv_bytes(
             byte_offset,
             byte_length,
             decode_hint,
+            segment_start_ms,
+            segment_end_ms,
         };
         record
             .validate()
@@ -1313,6 +1333,8 @@ fn index_local_prefix(
             byte_offset: None,
             byte_length: None,
             decode_hint,
+            segment_start_ms: None,
+            segment_end_ms: None,
         };
         record
             .validate()
@@ -1465,6 +1487,8 @@ fn index_s3_prefix(
             let mut byte_offset: Option<u64> = None;
             let mut byte_length: Option<u64> = None;
             let mut decode_hint: Option<String> = None;
+            let mut segment_start_ms: Option<u64> = None;
+            let mut segment_end_ms: Option<u64> = None;
 
             if cols.len() >= 4 {
                 if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
@@ -1493,12 +1517,30 @@ fn index_s3_prefix(
                 decode_hint = Some(hint);
             }
 
+            if cols.len() >= 7 {
+                if !cols[5].trim().is_empty() || !cols[6].trim().is_empty() {
+                    segment_start_ms = Some(cols[5].trim().parse().map_err(|_| {
+                        SnapshotError::S3Index(format!("line {}: bad segment_start_ms", i + 2))
+                    })?);
+                    segment_end_ms = Some(cols[6].trim().parse().map_err(|_| {
+                        SnapshotError::S3Index(format!("line {}: bad segment_end_ms", i + 2))
+                    })?);
+                }
+            } else if cols.len() == 6 {
+                return Err(SnapshotError::S3Index(format!(
+                    "line {}: segment_start_ms and segment_end_ms must be set together",
+                    i + 2
+                )));
+            }
+
             let record = ManifestRecord {
                 sample_id,
                 location,
                 byte_offset,
                 byte_length,
                 decode_hint,
+                segment_start_ms,
+                segment_end_ms,
             };
             record.validate().map_err(|e| {
                 SnapshotError::S3Index(format!(
@@ -1943,6 +1985,8 @@ fn index_s3_prefix(
                 byte_offset: None,
                 byte_length: None,
                 decode_hint,
+                segment_start_ms: None,
+                segment_end_ms: None,
             };
             record.validate().map_err(|e| {
                 SnapshotError::S3Index(format!("indexed record failed validation: {e}"))
@@ -2205,6 +2249,8 @@ fn index_s3_prefix(
                         byte_offset: None,
                         byte_length: None,
                         decode_hint,
+                        segment_start_ms: None,
+                        segment_end_ms: None,
                     };
                     record.validate().map_err(|e| {
                         SnapshotError::S3Index(format!("indexed record failed validation: {e}"))
@@ -2325,6 +2371,8 @@ fn load_dev_manifest_tsv(path: &PathBuf) -> Result<(Vec<ManifestRecord>, Vec<u8>
         let mut byte_offset: Option<u64> = None;
         let mut byte_length: Option<u64> = None;
         let mut decode_hint: Option<String> = None;
+        let mut segment_start_ms: Option<u64> = None;
+        let mut segment_end_ms: Option<u64> = None;
 
         if cols.len() >= 4 {
             if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
@@ -2359,12 +2407,36 @@ fn load_dev_manifest_tsv(path: &PathBuf) -> Result<(Vec<ManifestRecord>, Vec<u8>
             decode_hint = Some(hint);
         }
 
+        if cols.len() >= 7 {
+            if !cols[5].trim().is_empty() || !cols[6].trim().is_empty() {
+                segment_start_ms = Some(cols[5].trim().parse().map_err(|_| {
+                    SnapshotError::DevManifestParse(format!(
+                        "line {}: bad segment_start_ms",
+                        line_no + 1
+                    ))
+                })?);
+                segment_end_ms = Some(cols[6].trim().parse().map_err(|_| {
+                    SnapshotError::DevManifestParse(format!(
+                        "line {}: bad segment_end_ms",
+                        line_no + 1
+                    ))
+                })?);
+            }
+        } else if cols.len() == 6 {
+            return Err(SnapshotError::DevManifestParse(format!(
+                "line {}: segment_start_ms and segment_end_ms must be set together",
+                line_no + 1
+            )));
+        }
+
         let record = ManifestRecord {
             sample_id,
             location,
             byte_offset,
             byte_length,
             decode_hint,
+            segment_start_ms,
+            segment_end_ms,
         };
         record.validate().map_err(|e| {
             SnapshotError::DevManifestInvariant(format!("line {}: {e}", line_no + 1))
@@ -2407,12 +2479,16 @@ fn append_manifest_record_tsv_line(out: &mut Vec<u8>, r: &ManifestRecord) {
 
 fn manifest_record_tsv_line(r: &ManifestRecord) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\n",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         r.sample_id,
         r.location,
         r.byte_offset.map(|v| v.to_string()).unwrap_or_default(),
         r.byte_length.map(|v| v.to_string()).unwrap_or_default(),
-        r.decode_hint.clone().unwrap_or_default()
+        r.decode_hint.clone().unwrap_or_default(),
+        r.segment_start_ms
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        r.segment_end_ms.map(|v| v.to_string()).unwrap_or_default()
     )
 }
 
@@ -2461,6 +2537,8 @@ mod tests {
                 byte_offset: None,
                 byte_length: None,
                 decode_hint: None,
+                segment_start_ms: None,
+                segment_end_ms: None,
             },
             ManifestRecord {
                 sample_id: 1,
@@ -2468,6 +2546,8 @@ mod tests {
                 byte_offset: Some(0),
                 byte_length: Some(10),
                 decode_hint: Some("x".to_string()),
+                segment_start_ms: None,
+                segment_end_ms: None,
             },
         ];
         let canonical = canonicalize_manifest_bytes(&records);
@@ -2693,6 +2773,8 @@ mod tests {
                     byte_offset: Some(0),
                     byte_length: Some(4),
                     decode_hint: None,
+                    segment_start_ms: None,
+                    segment_end_ms: None,
                 },
                 RemoteResolveRecord {
                     sample_id: 1,
@@ -2700,6 +2782,8 @@ mod tests {
                     byte_offset: Some(4),
                     byte_length: Some(4),
                     decode_hint: None,
+                    segment_start_ms: None,
+                    segment_end_ms: None,
                 },
             ]),
         };
@@ -2711,6 +2795,8 @@ mod tests {
                 byte_offset: Some(0),
                 byte_length: Some(4),
                 decode_hint: None,
+                segment_start_ms: None,
+                segment_end_ms: None,
             },
             ManifestRecord {
                 sample_id: 1,
@@ -2718,6 +2804,8 @@ mod tests {
                 byte_offset: Some(4),
                 byte_length: Some(4),
                 decode_hint: None,
+                segment_start_ms: None,
+                segment_end_ms: None,
             },
         ];
         let expected_hash =
@@ -2737,6 +2825,8 @@ mod tests {
                 byte_offset: None,
                 byte_length: None,
                 decode_hint: None,
+                segment_start_ms: None,
+                segment_end_ms: None,
             }]),
         };
         let err = indexed_manifest_from_remote_response(response, true).unwrap_err();

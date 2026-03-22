@@ -350,6 +350,8 @@ pub fn pack_dir(cfg: PackDirConfig) -> Result<PackDirResult> {
             byte_offset: Some(data_offset),
             byte_length: Some(size),
             decode_hint,
+            segment_start_ms: None,
+            segment_end_ms: None,
         };
         record.validate()?;
         records.push(record);

@@ -1443,6 +1443,8 @@ impl ManifestRangeStreamParser {
         let mut byte_offset: Option<u64> = None;
         let mut byte_length: Option<u64> = None;
         let mut decode_hint: Option<String> = None;
+        let mut segment_start_ms: Option<u64> = None;
+        let mut segment_end_ms: Option<u64> = None;
 
         if cols.len() >= 4 {
             if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
@@ -1467,12 +1469,32 @@ impl ManifestRangeStreamParser {
             decode_hint = Some(cols[4].trim().to_string());
         }
 
+        if cols.len() >= 7 {
+            if !cols[5].trim().is_empty() || !cols[6].trim().is_empty() {
+                segment_start_ms =
+                    Some(cols[5].trim().parse().map_err(|_| {
+                        anyhow::anyhow!("line {}: bad segment_start_ms", self.line_no)
+                    })?);
+                segment_end_ms =
+                    Some(cols[6].trim().parse().map_err(|_| {
+                        anyhow::anyhow!("line {}: bad segment_end_ms", self.line_no)
+                    })?);
+            }
+        } else if cols.len() == 6 {
+            anyhow::bail!(
+                "line {}: segment_start_ms and segment_end_ms must be set together",
+                self.line_no
+            );
+        }
+
         let record = mx8_core::types::ManifestRecord {
             sample_id,
             location,
             byte_offset,
             byte_length,
             decode_hint,
+            segment_start_ms,
+            segment_end_ms,
         };
         record
             .validate()
@@ -2397,6 +2419,8 @@ async fn scan_s3_prefix_records_to_channel(
                     byte_offset: Some(0),
                     byte_length: Some(size),
                     decode_hint,
+                    segment_start_ms: None,
+                    segment_end_ms: None,
                 };
                 if let Some(out) = reservoir.push_and_maybe_pop(record) {
                     scan_emit_record(
@@ -2559,6 +2583,8 @@ async fn scan_gcs_prefix_records_to_channel(
                     byte_offset: Some(0),
                     byte_length: Some(size),
                     decode_hint,
+                    segment_start_ms: None,
+                    segment_end_ms: None,
                 };
                 if let Some(out) = reservoir.push_and_maybe_pop(record) {
                     scan_emit_record(
@@ -3087,6 +3113,8 @@ fn parse_canonical_manifest_tsv_reader<R: BufRead>(
         let mut byte_offset: Option<u64> = None;
         let mut byte_length: Option<u64> = None;
         let mut decode_hint: Option<String> = None;
+        let mut segment_start_ms: Option<u64> = None;
+        let mut segment_end_ms: Option<u64> = None;
 
         if cols.len() >= 4 {
             if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
@@ -3111,12 +3139,36 @@ fn parse_canonical_manifest_tsv_reader<R: BufRead>(
             decode_hint = Some(cols[4].trim().to_string());
         }
 
+        if cols.len() >= 7 {
+            if !cols[5].trim().is_empty() || !cols[6].trim().is_empty() {
+                segment_start_ms = Some(
+                    cols[5]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad segment_start_ms", line_no))?,
+                );
+                segment_end_ms = Some(
+                    cols[6]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad segment_end_ms", line_no))?,
+                );
+            }
+        } else if cols.len() == 6 {
+            anyhow::bail!(
+                "line {}: segment_start_ms and segment_end_ms must be set together",
+                line_no
+            );
+        }
+
         let record = mx8_core::types::ManifestRecord {
             sample_id,
             location,
             byte_offset,
             byte_length,
             decode_hint,
+            segment_start_ms,
+            segment_end_ms,
         };
         record
             .validate()
@@ -3207,6 +3259,8 @@ fn parse_canonical_manifest_tsv_reader_range<R: BufRead>(
         let mut byte_offset: Option<u64> = None;
         let mut byte_length: Option<u64> = None;
         let mut decode_hint: Option<String> = None;
+        let mut segment_start_ms: Option<u64> = None;
+        let mut segment_end_ms: Option<u64> = None;
 
         if cols.len() >= 4 {
             if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
@@ -3231,12 +3285,36 @@ fn parse_canonical_manifest_tsv_reader_range<R: BufRead>(
             decode_hint = Some(cols[4].trim().to_string());
         }
 
+        if cols.len() >= 7 {
+            if !cols[5].trim().is_empty() || !cols[6].trim().is_empty() {
+                segment_start_ms = Some(
+                    cols[5]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad segment_start_ms", line_no))?,
+                );
+                segment_end_ms = Some(
+                    cols[6]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad segment_end_ms", line_no))?,
+                );
+            }
+        } else if cols.len() == 6 {
+            anyhow::bail!(
+                "line {}: segment_start_ms and segment_end_ms must be set together",
+                line_no
+            );
+        }
+
         let record = mx8_core::types::ManifestRecord {
             sample_id,
             location,
             byte_offset,
             byte_length,
             decode_hint,
+            segment_start_ms,
+            segment_end_ms,
         };
         record
             .validate()
@@ -3386,6 +3464,8 @@ mod s3_parse_tests {
                 byte_offset: Some(0),
                 byte_length: Some(1),
                 decode_hint: None,
+                segment_start_ms: None,
+                segment_end_ms: None,
             };
             if let Some(r) = reservoir.push_and_maybe_pop(record) {
                 out.push(r.sample_id);
@@ -3751,6 +3831,8 @@ mod manifest_reader_tests {
                 byte_offset: Some(0),
                 byte_length: Some(sizes[(i as usize) % sizes.len()]),
                 decode_hint: None,
+                segment_start_ms: None,
+                segment_end_ms: None,
             });
         }
 

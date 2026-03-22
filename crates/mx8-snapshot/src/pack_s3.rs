@@ -731,6 +731,8 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
                 byte_offset: Some(data_offset),
                 byte_length: Some(size),
                 decode_hint,
+                segment_start_ms: None,
+                segment_end_ms: None,
             };
             record.validate()?;
             records.push(record);

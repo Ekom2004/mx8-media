@@ -329,9 +329,9 @@ fn parse_canonical_manifest_tsv_bytes(
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() != 5 {
+        if cols.len() != 5 && cols.len() != 7 {
             return Err(VideoStage1Error::ManifestParse(format!(
-                "line {}: expected 5 manifest columns",
+                "line {}: expected 5 or 7 manifest columns",
                 line_no + 2
             )));
         }
@@ -364,12 +364,32 @@ fn parse_canonical_manifest_tsv_bytes(
         } else {
             Some(cols[4].to_string())
         };
+        let mut segment_start_ms: Option<u64> = None;
+        let mut segment_end_ms: Option<u64> = None;
+        if cols.len() == 7 {
+            if !cols[5].is_empty() || !cols[6].is_empty() {
+                segment_start_ms = Some(cols[5].parse::<u64>().map_err(|_| {
+                    VideoStage1Error::ManifestParse(format!(
+                        "line {}: invalid segment_start_ms",
+                        line_no + 2
+                    ))
+                })?);
+                segment_end_ms = Some(cols[6].parse::<u64>().map_err(|_| {
+                    VideoStage1Error::ManifestParse(format!(
+                        "line {}: invalid segment_end_ms",
+                        line_no + 2
+                    ))
+                })?);
+            }
+        }
         records.push(ManifestRecord {
             sample_id,
             location,
             byte_offset,
             byte_length,
             decode_hint,
+            segment_start_ms,
+            segment_end_ms,
         });
     }
     records.sort_by_key(|r| r.sample_id);
@@ -463,6 +483,8 @@ mod tests {
             byte_offset: None,
             byte_length: None,
             decode_hint: Some(decode_hint.to_string()),
+            segment_start_ms: None,
+            segment_end_ms: None,
         }
     }
 
@@ -510,6 +532,8 @@ mod tests {
                 byte_offset: None,
                 byte_length: None,
                 decode_hint: None,
+                segment_start_ms: None,
+                segment_end_ms: None,
             },
         ];
         let out = build_video_stage1_index(&hash, &records, &cfg()).expect("index");
