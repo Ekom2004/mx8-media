@@ -27,12 +27,15 @@ class MX8Client:
         source: str,
         transform: Transform | Sequence[Transform],
         sink: str,
+        find: str | None = None,
     ) -> Job:
         payload = {
             "source": source,
             "sink": sink,
             "transforms": _normalize_transforms(transform),
         }
+        if find is not None:
+            payload["find"] = find
         body = self._request("POST", "/v1/jobs", payload)
         return _job_from_payload(self, body)
 
@@ -98,4 +101,7 @@ def _job_from_payload(client: MX8Client, payload: dict[str, Any]) -> Job:
         status=payload["status"],
         source=payload["source"],
         sink=payload["sink"],
+        find=payload.get("find"),
+        matched_assets=payload.get("matched_assets"),
+        matched_segments=payload.get("matched_segments"),
     )

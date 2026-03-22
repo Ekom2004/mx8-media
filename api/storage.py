@@ -36,8 +36,10 @@ class InMemoryJobStore:
 
     def create_job(self, request: CreateJobRequest) -> JobRecord:
         record = JobRecord(
+            status=JobStatus.FINDING if request.find is not None else JobStatus.PENDING,
             source=request.source,
             sink=request.sink,
+            find=request.find,
             transforms=request.transforms,
         )
         with self._lock:
@@ -75,6 +77,10 @@ class InMemoryJobStore:
             update: dict[str, object] = {"updated_at": utc_now()}
             if payload.status is not None:
                 update["status"] = payload.status
+            if payload.matched_assets is not None:
+                update["matched_assets"] = payload.matched_assets
+            if payload.matched_segments is not None:
+                update["matched_segments"] = payload.matched_segments
             if payload.completed_objects is not None:
                 update["completed_objects"] = payload.completed_objects
             if payload.completed_bytes is not None:
@@ -105,8 +111,10 @@ class PostgresJobStore:
 
     def create_job(self, request: CreateJobRequest) -> JobRecord:
         record = JobRecord(
+            status=JobStatus.FINDING if request.find is not None else JobStatus.PENDING,
             source=request.source,
             sink=request.sink,
+            find=request.find,
             transforms=request.transforms,
         )
         transforms = [transform.model_dump(mode="json") for transform in record.transforms]
@@ -119,9 +127,12 @@ class PostgresJobStore:
                         status,
                         source,
                         sink,
+                        find_query,
                         transforms,
                         region,
                         instance_type,
+                        matched_assets,
+                        matched_segments,
                         total_objects,
                         total_bytes,
                         completed_objects,
@@ -131,20 +142,24 @@ class PostgresJobStore:
                         created_at,
                         updated_at
                     )
-                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     returning
-                        id, status, source, sink, transforms, region, instance_type,
-                        total_objects, total_bytes, completed_objects, completed_bytes,
-                        current_workers, desired_workers, created_at, updated_at
+                        id, status, source, sink, find_query, transforms, region, instance_type,
+                        matched_assets, matched_segments, total_objects, total_bytes,
+                        completed_objects, completed_bytes, current_workers, desired_workers,
+                        created_at, updated_at
                     """,
                     (
                         record.id,
                         record.status.value,
                         record.source,
                         record.sink,
+                        record.find,
                         self._jsonb(transforms),
                         record.region,
                         record.instance_type,
+                        record.matched_assets,
+                        record.matched_segments,
                         record.total_objects,
                         record.total_bytes,
                         record.completed_objects,
@@ -164,9 +179,10 @@ class PostgresJobStore:
                 cur.execute(
                     """
                     select
-                        id, status, source, sink, transforms, region, instance_type,
-                        total_objects, total_bytes, completed_objects, completed_bytes,
-                        current_workers, desired_workers, created_at, updated_at
+                        id, status, source, sink, find_query, transforms, region, instance_type,
+                        matched_assets, matched_segments, total_objects, total_bytes,
+                        completed_objects, completed_bytes, current_workers, desired_workers,
+                        created_at, updated_at
                     from jobs
                     where id = %s
                     """,
@@ -183,9 +199,10 @@ class PostgresJobStore:
                 cur.execute(
                     """
                     select
-                        id, status, source, sink, transforms, region, instance_type,
-                        total_objects, total_bytes, completed_objects, completed_bytes,
-                        current_workers, desired_workers, created_at, updated_at
+                        id, status, source, sink, find_query, transforms, region, instance_type,
+                        matched_assets, matched_segments, total_objects, total_bytes,
+                        completed_objects, completed_bytes, current_workers, desired_workers,
+                        created_at, updated_at
                     from jobs
                     order by created_at desc
                     """
@@ -202,9 +219,10 @@ class PostgresJobStore:
                     set status = %s, updated_at = %s
                     where id = %s
                     returning
-                        id, status, source, sink, transforms, region, instance_type,
-                        total_objects, total_bytes, completed_objects, completed_bytes,
-                        current_workers, desired_workers, created_at, updated_at
+                        id, status, source, sink, find_query, transforms, region, instance_type,
+                        matched_assets, matched_segments, total_objects, total_bytes,
+                        completed_objects, completed_bytes, current_workers, desired_workers,
+                        created_at, updated_at
                     """,
                     (status.value, utc_now(), job_id),
                 )
@@ -219,6 +237,12 @@ class PostgresJobStore:
         if payload.status is not None:
             update_fields.append("status = %s")
             params.append(payload.status.value)
+        if payload.matched_assets is not None:
+            update_fields.append("matched_assets = %s")
+            params.append(payload.matched_assets)
+        if payload.matched_segments is not None:
+            update_fields.append("matched_segments = %s")
+            params.append(payload.matched_segments)
         if payload.completed_objects is not None:
             update_fields.append("completed_objects = %s")
             params.append(payload.completed_objects)
@@ -253,9 +277,10 @@ class PostgresJobStore:
                     set {", ".join(update_fields)}
                     where id = %s
                     returning
-                        id, status, source, sink, transforms, region, instance_type,
-                        total_objects, total_bytes, completed_objects, completed_bytes,
-                        current_workers, desired_workers, created_at, updated_at
+                        id, status, source, sink, find_query, transforms, region, instance_type,
+                        matched_assets, matched_segments, total_objects, total_bytes,
+                        completed_objects, completed_bytes, current_workers, desired_workers,
+                        created_at, updated_at
                     """,
                     params,
                 )
@@ -282,9 +307,12 @@ class PostgresJobStore:
                         status text not null,
                         source text not null,
                         sink text not null,
+                        find_query text,
                         transforms jsonb not null,
                         region text,
                         instance_type text,
+                        matched_assets bigint,
+                        matched_segments bigint,
                         total_objects bigint,
                         total_bytes bigint,
                         completed_objects bigint not null default 0,
@@ -298,6 +326,9 @@ class PostgresJobStore:
                 )
                 cur.execute("alter table jobs add column if not exists region text")
                 cur.execute("alter table jobs add column if not exists instance_type text")
+                cur.execute("alter table jobs add column if not exists find_query text")
+                cur.execute("alter table jobs add column if not exists matched_assets bigint")
+                cur.execute("alter table jobs add column if not exists matched_segments bigint")
                 cur.execute("alter table jobs add column if not exists total_objects bigint")
                 cur.execute("alter table jobs add column if not exists total_bytes bigint")
                 cur.execute(
@@ -326,9 +357,12 @@ class PostgresJobStore:
             status=JobStatus(str(data["status"])),
             source=str(data["source"]),
             sink=str(data["sink"]),
+            find=cast(str | None, data.get("find_query")),
             transforms=transforms,
             region=cast(str | None, data.get("region")),
             instance_type=cast(str | None, data.get("instance_type")),
+            matched_assets=cast(int | None, data.get("matched_assets")),
+            matched_segments=cast(int | None, data.get("matched_segments")),
             total_objects=cast(int | None, data.get("total_objects")),
             total_bytes=cast(int | None, data.get("total_bytes")),
             completed_objects=int(cast(int | None, data.get("completed_objects")) or 0),

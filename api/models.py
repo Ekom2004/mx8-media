@@ -6,7 +6,7 @@ import math
 from typing import Any, Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -14,6 +14,7 @@ def utc_now() -> datetime:
 
 
 class JobStatus(str, Enum):
+    FINDING = "FINDING"
     PENDING = "PENDING"
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
@@ -148,7 +149,18 @@ class TransformSpec(BaseModel):
 class CreateJobRequest(BaseModel):
     source: str
     sink: str
+    find: Optional[str] = None
     transforms: list[TransformSpec]
+
+    @field_validator("find")
+    @classmethod
+    def normalize_find(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("find must be non-empty")
+        return normalized
 
     @model_validator(mode="after")
     def validate_job(self) -> "CreateJobRequest":
@@ -166,9 +178,12 @@ class JobRecord(BaseModel):
     status: JobStatus = JobStatus.PENDING
     source: str
     sink: str
+    find: Optional[str] = None
     transforms: list[TransformSpec]
     region: Optional[str] = None
     instance_type: Optional[str] = None
+    matched_assets: Optional[int] = None
+    matched_segments: Optional[int] = None
     total_objects: Optional[int] = None
     total_bytes: Optional[int] = None
     completed_objects: int = 0
@@ -186,6 +201,8 @@ class JobStatusUpdate(BaseModel):
 class JobProgressUpdate(BaseModel):
     job_id: str
     status: Optional[JobStatus] = None
+    matched_assets: Optional[int] = None
+    matched_segments: Optional[int] = None
     completed_objects: Optional[int] = None
     completed_bytes: Optional[int] = None
     current_workers: Optional[int] = None

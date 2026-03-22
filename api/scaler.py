@@ -9,6 +9,7 @@ from .launcher import CoordinatorLauncher
 from .models import JobProgressUpdate, JobRecord, JobStatus
 from .storage import JobStore
 
+# `FINDING` jobs are intentionally parked until the planner/finder service exists.
 ACTIVE_JOB_STATUSES = {JobStatus.PENDING, JobStatus.QUEUED, JobStatus.RUNNING}
 TERMINAL_JOB_STATUSES = {JobStatus.COMPLETE, JobStatus.FAILED}
 

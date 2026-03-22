@@ -13,10 +13,11 @@ def run(
     *,
     transform: Transform | Sequence[Transform],
     sink: str,
+    find: str | None = None,
     client: MX8Client | None = None,
 ) -> Job:
     active_client = client or default_client()
-    return active_client.submit_job(source=source, transform=transform, sink=sink)
+    return active_client.submit_job(source=source, transform=transform, sink=sink, find=find)
 
 
 __all__ = [
