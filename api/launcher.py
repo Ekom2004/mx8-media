@@ -242,9 +242,13 @@ class CoordinatorLauncher:
                         "MX8_COORD_STATE_STORE_ENABLE", "false"
                     ),
                     "MX8_LEASE_LOG_PATH": coordinator_env.get("MX8_LEASE_LOG_PATH", "none"),
-                    "MX8_DATASET_LINK": record.source,
                 }
             )
+            if record.manifest_hash:
+                coordinator_env["MX8_MANIFEST_HASH"] = record.manifest_hash
+                coordinator_env.pop("MX8_DATASET_LINK", None)
+            else:
+                coordinator_env["MX8_DATASET_LINK"] = record.source
             coordinator_log_path = run_dir / "coordinator.log"
             coordinator = _spawn_checked(
                 self._coordinator_command(record),

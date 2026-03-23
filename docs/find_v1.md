@@ -45,10 +45,12 @@ API-layer jobs store:
 - `find`
 - `matched_assets`
 - `matched_segments`
+- `manifest_hash`
 
 Job status adds:
 
 - `FINDING`
+- `PLANNED`
 
 The planner resolves `find` into a derived manifest. Agent-facing jobs stay transform-only. Manifest records will later gain temporal segment bounds so workers can process selected clips without knowing semantic search happened upstream.
 
@@ -76,3 +78,11 @@ Out of scope for v1:
 ## PR1 behavior
 
 Until the planner exists, jobs with `find` enter `FINDING` and are intentionally not launched by the scaler. This is safer than silently ignoring the query.
+
+## PR3 behavior
+
+Once the planner exists:
+
+- zero-match jobs complete successfully with `matched_assets=0` and `matched_segments=0`
+- matched jobs produce a derived manifest and move to `PLANNED`
+- `PLANNED` jobs remain parked until PR4 adds segment-aware worker execution

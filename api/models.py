@@ -15,6 +15,7 @@ def utc_now() -> datetime:
 
 class JobStatus(str, Enum):
     FINDING = "FINDING"
+    PLANNED = "PLANNED"
     PENDING = "PENDING"
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
@@ -170,6 +171,11 @@ class CreateJobRequest(BaseModel):
             raise ValueError("sink must be non-empty")
         if not self.transforms:
             raise ValueError("transforms must be non-empty")
+        if self.find is not None:
+            if not all(transform.type.startswith("video.") for transform in self.transforms):
+                raise ValueError("find currently supports only video transforms")
+            if not any(transform.type == "video.extract_frames" for transform in self.transforms):
+                raise ValueError("find currently requires video.extract_frames")
         return self
 
 
@@ -182,6 +188,7 @@ class JobRecord(BaseModel):
     transforms: list[TransformSpec]
     region: Optional[str] = None
     instance_type: Optional[str] = None
+    manifest_hash: Optional[str] = None
     matched_assets: Optional[int] = None
     matched_segments: Optional[int] = None
     total_objects: Optional[int] = None
@@ -201,6 +208,7 @@ class JobStatusUpdate(BaseModel):
 class JobProgressUpdate(BaseModel):
     job_id: str
     status: Optional[JobStatus] = None
+    manifest_hash: Optional[str] = None
     matched_assets: Optional[int] = None
     matched_segments: Optional[int] = None
     completed_objects: Optional[int] = None
