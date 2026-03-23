@@ -86,3 +86,12 @@ Once the planner exists:
 - zero-match jobs complete successfully with `matched_assets=0` and `matched_segments=0`
 - matched jobs produce a derived manifest and move to `PLANNED`
 - `PLANNED` jobs remain parked until PR4 adds segment-aware worker execution
+
+## PR4 behavior
+
+Once workers honor manifest segment bounds:
+
+- the planner still writes a derived manifest and may briefly use `PLANNED`
+- matched jobs immediately advance into the normal execution path after planning
+- workers process only the selected temporal segments and never receive the semantic query
+- segment-derived outputs include segment identity so multiple matches from the same source do not collide in the sink

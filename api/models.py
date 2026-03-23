@@ -172,10 +172,12 @@ class CreateJobRequest(BaseModel):
         if not self.transforms:
             raise ValueError("transforms must be non-empty")
         if self.find is not None:
-            if not all(transform.type.startswith("video.") for transform in self.transforms):
-                raise ValueError("find currently supports only video transforms")
-            if not any(transform.type == "video.extract_frames" for transform in self.transforms):
-                raise ValueError("find currently requires video.extract_frames")
+            if self.transforms[0].type != "video.extract_frames":
+                raise ValueError("find currently requires video.extract_frames as the first transform")
+            if not all(transform.type.startswith("image.") for transform in self.transforms[1:]):
+                raise ValueError(
+                    "find currently supports only image transforms after video.extract_frames"
+                )
         return self
 
 

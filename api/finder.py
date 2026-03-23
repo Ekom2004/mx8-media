@@ -410,7 +410,7 @@ def build_find_provider() -> FindProvider:
 
 
 def should_auto_queue_after_plan() -> bool:
-    raw = os.getenv("MX8_FIND_AUTO_QUEUE_AFTER_PLAN", "false").strip().lower()
+    raw = os.getenv("MX8_FIND_AUTO_QUEUE_AFTER_PLAN", "true").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 

@@ -9,8 +9,9 @@ from .launcher import CoordinatorLauncher
 from .models import JobProgressUpdate, JobRecord, JobStatus
 from .storage import JobStore
 
-# `FINDING` jobs are planner-owned and `PLANNED` jobs stay parked until PR4 adds
-# segment-aware worker execution.
+# `FINDING` jobs are planner-owned. `PLANNED` remains a transient planner state but
+# matched jobs should normally advance into the active scaler path immediately after
+# planning succeeds.
 ACTIVE_JOB_STATUSES = {JobStatus.PENDING, JobStatus.QUEUED, JobStatus.RUNNING}
 TERMINAL_JOB_STATUSES = {JobStatus.COMPLETE, JobStatus.FAILED}
 

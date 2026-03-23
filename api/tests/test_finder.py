@@ -163,13 +163,103 @@ class FinderTests(unittest.TestCase):
         self.assertEqual(updated.manifest_hash, "basehash")
 
     def test_find_requires_video_extract_frames(self) -> None:
-        with self.assertRaisesRegex(ValueError, "find currently requires video.extract_frames"):
+        with self.assertRaisesRegex(
+            ValueError, "find currently requires video.extract_frames as the first transform"
+        ):
             CreateJobRequest(
                 source="s3://raw-dashcam-archive/",
                 sink="s3://training-dataset/",
                 find="match",
                 transforms=[TransformSpec(type="video.transcode", params={"codec": "h264", "crf": 23})],
             )
+
+    def test_find_allows_image_transforms_after_video_extract_frames(self) -> None:
+        request = CreateJobRequest(
+            source="s3://raw-dashcam-archive/",
+            sink="s3://training-dataset/",
+            find="match",
+            transforms=[
+                TransformSpec(type="video.extract_frames", params={"fps": 1, "format": "jpg"}),
+                TransformSpec(
+                    type="image.resize",
+                    params={"width": 128, "height": 128, "maintain_aspect": False},
+                ),
+            ],
+        )
+        self.assertEqual(request.transforms[0].type, "video.extract_frames")
+        self.assertEqual(request.transforms[1].type, "image.resize")
+
+    def test_find_rejects_video_transforms_after_video_extract_frames(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "find currently supports only image transforms after video.extract_frames",
+        ):
+            CreateJobRequest(
+                source="s3://raw-dashcam-archive/",
+                sink="s3://training-dataset/",
+                find="match",
+                transforms=[
+                    TransformSpec(type="video.extract_frames", params={"fps": 1, "format": "jpg"}),
+                    TransformSpec(type="video.transcode", params={"codec": "h264", "crf": 23}),
+                ],
+            )
+
+    def test_find_rejects_video_transform_before_video_extract_frames(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "find currently requires video.extract_frames as the first transform"
+        ):
+            CreateJobRequest(
+                source="s3://raw-dashcam-archive/",
+                sink="s3://training-dataset/",
+                find="match",
+                transforms=[
+                    TransformSpec(
+                        type="video.resize",
+                        params={"width": 1920, "height": 1080, "maintain_aspect": True},
+                    ),
+                    TransformSpec(type="video.extract_frames", params={"fps": 1, "format": "jpg"}),
+                ],
+            )
+
+    def test_find_job_auto_queues_after_plan_when_enabled(self) -> None:
+        os.environ["MX8_FIND_AUTO_QUEUE_AFTER_PLAN"] = "true"
+        store = InMemoryJobStore()
+        record = store.create_job(
+            CreateJobRequest(
+                source="s3://raw-dashcam-archive/",
+                sink="s3://training-dataset/",
+                find="match",
+                transforms=[TransformSpec(type="video.extract_frames", params={"fps": 1, "format": "jpg"})],
+            )
+        )
+        wake_calls: list[str] = []
+        finder = JobFinder(
+            store,
+            manifest_resolver=FakeResolver(
+                "basehash",
+                [
+                    ManifestRecord(
+                        sample_id=0,
+                        location="s3://bucket/input-0.mp4",
+                        byte_offset=None,
+                        byte_length=None,
+                        decode_hint="mx8:video;codec=h264",
+                    )
+                ],
+            ),
+            provider=FakeProvider([MatchSegment(sample_id=0, start_ms=500, end_ms=1_500)]),
+            wake_scaler=lambda: wake_calls.append("wake"),
+        )
+
+        finder.reconcile_once()
+
+        updated = store.get_job(record.id)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.status, JobStatus.PENDING)
+        self.assertEqual(updated.matched_assets, 1)
+        self.assertEqual(updated.matched_segments, 1)
+        self.assertEqual(wake_calls, ["wake"])
 
     def test_finder_initializes_lazily_when_manifest_store_is_not_local(self) -> None:
         prev_manifest_root = os.environ.get("MX8_MANIFEST_STORE_ROOT")
