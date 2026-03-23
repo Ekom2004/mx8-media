@@ -10,8 +10,10 @@ router = APIRouter(prefix="/v1/jobs", tags=["jobs"])
 @router.post("", response_model=JobRecord, status_code=status.HTTP_201_CREATED)
 def create_job(payload: CreateJobRequest, request: Request) -> JobRecord:
     store = request.app.state.store
+    finder = request.app.state.finder
     scaler = request.app.state.scaler
     record = store.create_job(payload)
+    finder.wake()
     scaler.wake()
     return record
 

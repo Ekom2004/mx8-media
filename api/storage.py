@@ -77,6 +77,8 @@ class InMemoryJobStore:
             update: dict[str, object] = {"updated_at": utc_now()}
             if payload.status is not None:
                 update["status"] = payload.status
+            if payload.manifest_hash is not None:
+                update["manifest_hash"] = payload.manifest_hash
             if payload.matched_assets is not None:
                 update["matched_assets"] = payload.matched_assets
             if payload.matched_segments is not None:
@@ -131,6 +133,7 @@ class PostgresJobStore:
                         transforms,
                         region,
                         instance_type,
+                        manifest_hash,
                         matched_assets,
                         matched_segments,
                         total_objects,
@@ -142,9 +145,10 @@ class PostgresJobStore:
                         created_at,
                         updated_at
                     )
-                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     returning
                         id, status, source, sink, find_query, transforms, region, instance_type,
+                        manifest_hash,
                         matched_assets, matched_segments, total_objects, total_bytes,
                         completed_objects, completed_bytes, current_workers, desired_workers,
                         created_at, updated_at
@@ -158,6 +162,7 @@ class PostgresJobStore:
                         self._jsonb(transforms),
                         record.region,
                         record.instance_type,
+                        record.manifest_hash,
                         record.matched_assets,
                         record.matched_segments,
                         record.total_objects,
@@ -180,6 +185,7 @@ class PostgresJobStore:
                     """
                     select
                         id, status, source, sink, find_query, transforms, region, instance_type,
+                        manifest_hash,
                         matched_assets, matched_segments, total_objects, total_bytes,
                         completed_objects, completed_bytes, current_workers, desired_workers,
                         created_at, updated_at
@@ -200,6 +206,7 @@ class PostgresJobStore:
                     """
                     select
                         id, status, source, sink, find_query, transforms, region, instance_type,
+                        manifest_hash,
                         matched_assets, matched_segments, total_objects, total_bytes,
                         completed_objects, completed_bytes, current_workers, desired_workers,
                         created_at, updated_at
@@ -220,6 +227,7 @@ class PostgresJobStore:
                     where id = %s
                     returning
                         id, status, source, sink, find_query, transforms, region, instance_type,
+                        manifest_hash,
                         matched_assets, matched_segments, total_objects, total_bytes,
                         completed_objects, completed_bytes, current_workers, desired_workers,
                         created_at, updated_at
@@ -237,6 +245,9 @@ class PostgresJobStore:
         if payload.status is not None:
             update_fields.append("status = %s")
             params.append(payload.status.value)
+        if payload.manifest_hash is not None:
+            update_fields.append("manifest_hash = %s")
+            params.append(payload.manifest_hash)
         if payload.matched_assets is not None:
             update_fields.append("matched_assets = %s")
             params.append(payload.matched_assets)
@@ -278,6 +289,7 @@ class PostgresJobStore:
                     where id = %s
                     returning
                         id, status, source, sink, find_query, transforms, region, instance_type,
+                        manifest_hash,
                         matched_assets, matched_segments, total_objects, total_bytes,
                         completed_objects, completed_bytes, current_workers, desired_workers,
                         created_at, updated_at
@@ -311,6 +323,7 @@ class PostgresJobStore:
                         transforms jsonb not null,
                         region text,
                         instance_type text,
+                        manifest_hash text,
                         matched_assets bigint,
                         matched_segments bigint,
                         total_objects bigint,
@@ -327,6 +340,7 @@ class PostgresJobStore:
                 cur.execute("alter table jobs add column if not exists region text")
                 cur.execute("alter table jobs add column if not exists instance_type text")
                 cur.execute("alter table jobs add column if not exists find_query text")
+                cur.execute("alter table jobs add column if not exists manifest_hash text")
                 cur.execute("alter table jobs add column if not exists matched_assets bigint")
                 cur.execute("alter table jobs add column if not exists matched_segments bigint")
                 cur.execute("alter table jobs add column if not exists total_objects bigint")
@@ -361,6 +375,7 @@ class PostgresJobStore:
             transforms=transforms,
             region=cast(str | None, data.get("region")),
             instance_type=cast(str | None, data.get("instance_type")),
+            manifest_hash=cast(str | None, data.get("manifest_hash")),
             matched_assets=cast(int | None, data.get("matched_assets")),
             matched_segments=cast(int | None, data.get("matched_segments")),
             total_objects=cast(int | None, data.get("total_objects")),

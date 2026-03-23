@@ -4,6 +4,7 @@ import os
 
 from fastapi import FastAPI
 
+from .finder import JobFinder
 from .launcher import CoordinatorLauncher
 from .routers import jobs, webhooks
 from .scaler import JobScaler
@@ -15,6 +16,7 @@ def create_app() -> FastAPI:
     app.state.store = build_job_store()
     app.state.launcher = CoordinatorLauncher()
     app.state.scaler = JobScaler(app.state.store, app.state.launcher)
+    app.state.finder = JobFinder(app.state.store, wake_scaler=app.state.scaler.wake)
     app.include_router(jobs.router)
     app.include_router(webhooks.router)
 
@@ -23,11 +25,13 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     @app.on_event("startup")
-    def startup_scaler() -> None:
+    def startup_background_loops() -> None:
+        app.state.finder.start()
         app.state.scaler.start(os.getenv("MX8_API_BASE_URL", "http://127.0.0.1:8000"))
 
     @app.on_event("shutdown")
     def shutdown_launcher() -> None:
+        app.state.finder.stop()
         app.state.scaler.stop()
         app.state.launcher.terminate_all()
 
