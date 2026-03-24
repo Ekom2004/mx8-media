@@ -3,18 +3,16 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from api.finder import (
-    JobFinder,
-    ManifestRecord,
-    MatchSegment,
-    LocalFsManifestStore,
-    parse_canonical_manifest_tsv,
-)
+from api.find_contracts import FindShard, FindShardResult, FindShardStats, ManifestRecord, MatchSegment
+from api.find_access import PassthroughSourceAccessResolver
+from api.find_dispatcher import FindDispatcher, FindTransport
+from api.finder import JobFinder, LocalFsManifestStore, parse_canonical_manifest_tsv
 from api.models import CreateJobRequest, JobStatus, TransformSpec
 from api.storage import InMemoryJobStore
 
@@ -29,18 +27,37 @@ class FakeResolver:
         return self.manifest_hash, list(self.records)
 
 
-class FakeProvider:
-    def __init__(self, segments: list[MatchSegment]) -> None:
-        self.segments = segments
+class StaticTransport:
+    def __init__(self, segments_by_sample_id: dict[int, list[MatchSegment]]) -> None:
+        self._segments_by_sample_id = segments_by_sample_id
 
-    def find_video_segments(
+    def process_shard(self, shard: FindShard) -> FindShardResult:
+        hits = tuple(self._segments_by_sample_id.get(shard.sample_id, []))
+        return FindShardResult(
+            shard_id=shard.shard_id,
+            job_id=shard.job_id,
+            customer_id=shard.customer_id,
+            asset_id=shard.asset_id,
+            status="ok",
+            hits=hits,
+            stats=FindShardStats(sampled_frames=1, decode_ms=1, inference_ms=1, wall_ms=1),
+        )
+
+
+class FakeDurationResolver:
+    def __init__(self, durations_ms: dict[str, int]) -> None:
+        self._durations_ms = durations_ms
+
+    def resolve_duration_ms(
         self,
         *,
-        query: str,
-        records: list[ManifestRecord],
-    ) -> list[MatchSegment]:
-        del query, records
-        return list(self.segments)
+        location: str,
+        source_access_url: str | None,
+        decode_hint: str | None,
+    ) -> int:
+        del source_access_url
+        del decode_hint
+        return self._durations_ms[location]
 
 
 class FinderTests(unittest.TestCase):
@@ -72,36 +89,52 @@ class FinderTests(unittest.TestCase):
                 transforms=[TransformSpec(type="video.extract_frames", params={"fps": 1, "format": "jpg"})],
             )
         )
-        finder = JobFinder(
-            store,
-            manifest_resolver=FakeResolver(
-                "basehash",
-                [
-                    ManifestRecord(
-                        sample_id=0,
-                        location="s3://bucket/input-0.mp4",
-                        byte_offset=None,
-                        byte_length=None,
-                        decode_hint="mx8:video;codec=h264",
-                    ),
-                    ManifestRecord(
-                        sample_id=1,
-                        location="s3://bucket/input-1.mp4",
-                        byte_offset=None,
-                        byte_length=None,
-                        decode_hint="mx8:video;codec=h264",
-                    ),
-                ],
+        dispatcher = FindDispatcher(
+            access_resolver=PassthroughSourceAccessResolver(),
+            transport=StaticTransport(
+                {
+                    1: [
+                        MatchSegment(sample_id=1, start_ms=12_340, end_ms=12_890),
+                        MatchSegment(sample_id=1, start_ms=20_000, end_ms=20_500),
+                    ]
+                }
             ),
-            provider=FakeProvider(
-                [
-                    MatchSegment(sample_id=1, start_ms=12_340, end_ms=12_890),
-                    MatchSegment(sample_id=1, start_ms=20_000, end_ms=20_500),
-                ]
+            duration_resolver=FakeDurationResolver(
+                {
+                    "s3://bucket/input-0.mp4": 60_000,
+                    "s3://bucket/input-1.mp4": 60_000,
+                }
             ),
         )
+        dispatcher.start()
+        try:
+            finder = JobFinder(
+                store,
+                dispatcher=dispatcher,
+                manifest_resolver=FakeResolver(
+                    "basehash",
+                    [
+                        ManifestRecord(
+                            sample_id=0,
+                            location="s3://bucket/input-0.mp4",
+                            byte_offset=None,
+                            byte_length=None,
+                            decode_hint="mx8:video;codec=h264",
+                        ),
+                        ManifestRecord(
+                            sample_id=1,
+                            location="s3://bucket/input-1.mp4",
+                            byte_offset=None,
+                            byte_length=None,
+                            decode_hint="mx8:video;codec=h264",
+                        ),
+                    ],
+                ),
+            )
 
-        finder.reconcile_once()
+            self._reconcile_until_terminal(finder, store, record.id)
+        finally:
+            dispatcher.stop()
 
         updated = store.get_job(record.id)
         self.assertIsNotNone(updated)
@@ -133,24 +166,33 @@ class FinderTests(unittest.TestCase):
                 transforms=[TransformSpec(type="video.extract_frames", params={"fps": 1, "format": "jpg"})],
             )
         )
-        finder = JobFinder(
-            store,
-            manifest_resolver=FakeResolver(
-                "basehash",
-                [
-                    ManifestRecord(
-                        sample_id=0,
-                        location="s3://bucket/input-0.mp4",
-                        byte_offset=None,
-                        byte_length=None,
-                        decode_hint="mx8:video;codec=h264",
-                    )
-                ],
-            ),
-            provider=FakeProvider([]),
+        dispatcher = FindDispatcher(
+            transport=StaticTransport({}),
+            access_resolver=PassthroughSourceAccessResolver(),
+            duration_resolver=FakeDurationResolver({"s3://bucket/input-0.mp4": 60_000}),
         )
+        dispatcher.start()
+        try:
+            finder = JobFinder(
+                store,
+                dispatcher=dispatcher,
+                manifest_resolver=FakeResolver(
+                    "basehash",
+                    [
+                        ManifestRecord(
+                            sample_id=0,
+                            location="s3://bucket/input-0.mp4",
+                            byte_offset=None,
+                            byte_length=None,
+                            decode_hint="mx8:video;codec=h264",
+                        )
+                    ],
+                ),
+            )
 
-        finder.reconcile_once()
+            self._reconcile_until_terminal(finder, store, record.id)
+        finally:
+            dispatcher.stop()
 
         updated = store.get_job(record.id)
         self.assertIsNotNone(updated)
@@ -233,25 +275,34 @@ class FinderTests(unittest.TestCase):
             )
         )
         wake_calls: list[str] = []
-        finder = JobFinder(
-            store,
-            manifest_resolver=FakeResolver(
-                "basehash",
-                [
-                    ManifestRecord(
-                        sample_id=0,
-                        location="s3://bucket/input-0.mp4",
-                        byte_offset=None,
-                        byte_length=None,
-                        decode_hint="mx8:video;codec=h264",
-                    )
-                ],
-            ),
-            provider=FakeProvider([MatchSegment(sample_id=0, start_ms=500, end_ms=1_500)]),
-            wake_scaler=lambda: wake_calls.append("wake"),
+        dispatcher = FindDispatcher(
+            transport=StaticTransport({0: [MatchSegment(sample_id=0, start_ms=500, end_ms=1_500)]}),
+            access_resolver=PassthroughSourceAccessResolver(),
+            duration_resolver=FakeDurationResolver({"s3://bucket/input-0.mp4": 60_000}),
         )
+        dispatcher.start()
+        try:
+            finder = JobFinder(
+                store,
+                dispatcher=dispatcher,
+                manifest_resolver=FakeResolver(
+                    "basehash",
+                    [
+                        ManifestRecord(
+                            sample_id=0,
+                            location="s3://bucket/input-0.mp4",
+                            byte_offset=None,
+                            byte_length=None,
+                            decode_hint="mx8:video;codec=h264",
+                        )
+                    ],
+                ),
+                wake_scaler=lambda: wake_calls.append("wake"),
+            )
 
-        finder.reconcile_once()
+            self._reconcile_until_terminal(finder, store, record.id)
+        finally:
+            dispatcher.stop()
 
         updated = store.get_job(record.id)
         self.assertIsNotNone(updated)
@@ -272,6 +323,15 @@ class FinderTests(unittest.TestCase):
                 os.environ.pop("MX8_MANIFEST_STORE_ROOT", None)
             else:
                 os.environ["MX8_MANIFEST_STORE_ROOT"] = prev_manifest_root
+
+    def _reconcile_until_terminal(self, finder: JobFinder, store: InMemoryJobStore, job_id: str) -> None:
+        for _ in range(50):
+            finder.reconcile_once()
+            record = store.get_job(job_id)
+            if record is not None and record.status != JobStatus.FINDING:
+                return
+            time.sleep(0.01)
+        self.fail("job did not leave FINDING")
 
 
 if __name__ == "__main__":

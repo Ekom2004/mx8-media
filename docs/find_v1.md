@@ -95,3 +95,7 @@ Once workers honor manifest segment bounds:
 - matched jobs immediately advance into the normal execution path after planning
 - workers process only the selected temporal segments and never receive the semantic query
 - segment-derived outputs include segment identity so multiple matches from the same source do not collide in the sink
+
+## Operations
+
+Operational deployment steps for the Modal-backed inference worker live in `docs/find_modal_deploy.md`.
