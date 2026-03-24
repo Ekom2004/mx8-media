@@ -8,7 +8,7 @@ from typing import Any
 from urllib import error, request
 
 from .job import Job
-from .transforms import Transform
+from .transforms import Transform, TransformChain
 
 
 class MX8APIError(RuntimeError):
@@ -25,7 +25,7 @@ class MX8Client:
         self,
         *,
         source: str,
-        transform: Transform | Sequence[Transform],
+        transform: Transform | Sequence[Transform] | TransformChain,
         sink: str,
         find: str | None = None,
     ) -> Job:
@@ -85,10 +85,15 @@ def default_client() -> MX8Client:
     )
 
 
-def _normalize_transforms(transform: Transform | Sequence[Transform]) -> list[dict[str, Any]]:
+def _normalize_transforms(
+    transform: Transform | Sequence[Transform] | TransformChain,
+) -> list[dict[str, Any]]:
     if isinstance(transform, Transform):
         return [transform.to_payload()]
-    payloads = [item.to_payload() for item in transform]
+    if isinstance(transform, TransformChain):
+        payloads = transform.to_payloads()
+    else:
+        payloads = [item.to_payload() for item in transform]
     if not payloads:
         raise ValueError("transform must contain at least one transform")
     return payloads

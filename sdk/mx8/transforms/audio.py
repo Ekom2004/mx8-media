@@ -17,6 +17,13 @@ def _require_finite_float(name: str, value: float) -> float:
     return value
 
 
+def _require_non_empty(name: str, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{name} must be non-empty")
+    return normalized
+
+
 def resample(*, rate: int = 16000, channels: int = 1) -> Transform:
     return Transform(
         kind="audio.resample",
@@ -33,4 +40,11 @@ def normalize(*, loudness: float = -14.0) -> Transform:
         params={
             "loudness": _require_finite_float("loudness", loudness),
         },
+    )
+
+
+def filter(*, expr: str) -> Transform:
+    return Transform(
+        kind="audio.filter",
+        params={"expr": _require_non_empty("expr", expr)},
     )

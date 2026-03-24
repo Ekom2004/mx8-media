@@ -97,3 +97,10 @@ def extract_audio(*, format: str, bitrate: str = "128k") -> Transform:
             "bitrate": _require_non_empty("bitrate", bitrate),
         },
     )
+
+
+def filter(*, expr: str) -> Transform:
+    return Transform(
+        kind="video.filter",
+        params={"expr": _require_non_empty("expr", expr)},
+    )

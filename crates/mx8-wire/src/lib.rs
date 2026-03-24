@@ -142,6 +142,15 @@ impl ToWire<wire::Transform> for core::TransformSpec {
                     quality: *quality,
                 })
             }
+            core::TransformSpec::VideoFilter { expr } => {
+                Kind::VideoFilter(wire::VideoFilter { expr: expr.clone() })
+            }
+            core::TransformSpec::AudioFilter { expr } => {
+                Kind::AudioFilter(wire::AudioFilter { expr: expr.clone() })
+            }
+            core::TransformSpec::ImageFilter { expr } => {
+                Kind::ImageFilter(wire::ImageFilter { expr: expr.clone() })
+            }
             core::TransformSpec::AudioResample { rate, channels } => {
                 Kind::AudioResample(wire::AudioResample {
                     rate: *rate,
@@ -212,6 +221,24 @@ impl TryToCore<core::TransformSpec> for wire::Transform {
                 Ok(core::TransformSpec::ImageConvert {
                     format: spec.format.clone(),
                     quality: spec.quality,
+                })
+            }
+            Kind::VideoFilter(spec) => {
+                non_empty("expr", &spec.expr)?;
+                Ok(core::TransformSpec::VideoFilter {
+                    expr: spec.expr.clone(),
+                })
+            }
+            Kind::AudioFilter(spec) => {
+                non_empty("expr", &spec.expr)?;
+                Ok(core::TransformSpec::AudioFilter {
+                    expr: spec.expr.clone(),
+                })
+            }
+            Kind::ImageFilter(spec) => {
+                non_empty("expr", &spec.expr)?;
+                Ok(core::TransformSpec::ImageFilter {
+                    expr: spec.expr.clone(),
                 })
             }
             Kind::AudioResample(spec) => Ok(core::TransformSpec::AudioResample {

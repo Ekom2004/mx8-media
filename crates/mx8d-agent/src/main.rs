@@ -775,6 +775,7 @@ fn is_image_transform(transform: &TransformSpec) -> bool {
         TransformSpec::ImageResize { .. }
             | TransformSpec::ImageCrop { .. }
             | TransformSpec::ImageConvert { .. }
+            | TransformSpec::ImageFilter { .. }
     )
 }
 
@@ -785,13 +786,16 @@ fn is_video_transform(transform: &TransformSpec) -> bool {
             | TransformSpec::VideoTranscode { .. }
             | TransformSpec::VideoExtractFrames { .. }
             | TransformSpec::VideoExtractAudio { .. }
+            | TransformSpec::VideoFilter { .. }
     )
 }
 
 fn is_audio_transform(transform: &TransformSpec) -> bool {
     matches!(
         transform,
-        TransformSpec::AudioResample { .. } | TransformSpec::AudioNormalize { .. }
+        TransformSpec::AudioResample { .. }
+            | TransformSpec::AudioNormalize { .. }
+            | TransformSpec::AudioFilter { .. }
     )
 }
 
@@ -833,6 +837,7 @@ fn transform_image_payload_for_sink(
                 image = image.crop_imm(x, y, *width, *height);
             }
             TransformSpec::ImageConvert { .. } => {}
+            TransformSpec::ImageFilter { .. } => continue,
             _ => anyhow::bail!("unsupported transform in image pipeline"),
         }
     }
@@ -1725,11 +1730,14 @@ fn transform_tag(transforms: &[TransformSpec]) -> String {
             TransformSpec::VideoResize { .. } => "resize",
             TransformSpec::VideoExtractFrames { .. } => "frames",
             TransformSpec::VideoExtractAudio { .. } => "extract_audio",
+            TransformSpec::VideoFilter { .. } => "filter",
             TransformSpec::ImageResize { .. } => "resize",
             TransformSpec::ImageCrop { .. } => "crop",
             TransformSpec::ImageConvert { .. } => "convert",
+            TransformSpec::ImageFilter { .. } => "filter",
             TransformSpec::AudioResample { .. } => "resample",
             TransformSpec::AudioNormalize { .. } => "normalize",
+            TransformSpec::AudioFilter { .. } => "filter",
         })
         .collect::<Vec<_>>()
         .join("__")

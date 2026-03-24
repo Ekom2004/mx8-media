@@ -20,7 +20,7 @@ job = client.submit_job(
     source="s3://customer/dataset",
     transforms=transforms.video
         .extract("frames")
-        .filter("duration > 5")
+        .filter(expr="duration > 5 && byte_size > 1_000_000_000")
         .deduplicate()
         .export("s3://clean/"),
     concurrency=10,
@@ -33,7 +33,7 @@ job.wait()
 Transforms are **chainable** and designed to read naturally without SQL. Each step adds metadata to the job graph:
 
 - `.extract("frames")`: reads an interval (seconds, frames, or scenes) from media and converts to image payloads.
-- `.filter("duration > 5")`: drops clips that fail the predicate; fields include duration, format, codec, width, height, and checksum.
+. `.filter(expr="duration > 5 && corrupt == false")`: drops clips that fail the predicate; expressions can reference duration, format, codec, width, height, frame rate, byte size, checksum/hash, stream_id/media_type, and the corrupt flag so you can keep only clean data.
 - `.deduplicate()`: eliminates redundant frames/media by content hash.
 - `.export("s3://clean/")`: writes outputs back to S3 or another configured bucket, skipping corrupted files by default.
 

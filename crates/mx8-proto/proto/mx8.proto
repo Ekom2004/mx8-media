@@ -78,6 +78,9 @@ message Transform {
     AudioResample audio_resample = 7;
     AudioNormalize audio_normalize = 8;
     ImageCrop image_crop = 9;
+    VideoFilter video_filter = 10;
+    AudioFilter audio_filter = 11;
+    ImageFilter image_filter = 12;
   }
 }
 
@@ -116,6 +119,18 @@ message ImageConvert {
 message ImageCrop {
   uint32 width = 1;
   uint32 height = 2;
+}
+
+message VideoFilter {
+  string expr = 1;
+}
+
+message AudioFilter {
+  string expr = 1;
+}
+
+message ImageFilter {
+  string expr = 1;
 }
 
 message AudioResample {

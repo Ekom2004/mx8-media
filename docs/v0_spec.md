@@ -11,7 +11,7 @@ MX8 v0 is about shipping fast, reliable media transforms with a single import (`
 ## Transform guarantees
 
 - `extract` enumerates frames, clips, or scenes and emits typed metadata (duration, format, codec, resolution).
-- `filter` accepts simple boolean expressions (`duration > 5`, `format == 'mp4'`, `corrupt == false`). We avoid SQL; the expression tree stays in the SDK and is compiled into the worker graph.
+- `filter` accepts simple boolean expressions through the `expr` argument (`duration > 5`, `format == 'mp4'`, `corrupt == false`). Expressions can compare duration, format, codec, width, height, fps, byte_size, checksum/hash, stream_id/media_type, and the built-in `corrupt` flag, so clients can keep only the slices that matter without writing SQL.
 - `deduplicate` uses content hashes/shingles to drop redundant assets.
 - `export` writes to S3 or another configured sink. The platform drops corrupted files by default, but customers can opt into flagged outputs.
 

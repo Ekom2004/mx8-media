@@ -27,6 +27,13 @@ def _require_quality(quality: int) -> int:
     return quality
 
 
+def _require_non_empty(name: str, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{name} must be non-empty")
+    return normalized
+
+
 def resize(*, width: int, height: int, maintain_aspect: bool = True) -> Transform:
     return Transform(
         kind="image.resize",
@@ -55,4 +62,11 @@ def convert(*, format: str, quality: int = 85) -> Transform:
             "format": _normalize_format(format),
             "quality": _require_quality(quality),
         },
+    )
+
+
+def filter(*, expr: str) -> Transform:
+    return Transform(
+        kind="image.filter",
+        params={"expr": _require_non_empty("expr", expr)},
     )

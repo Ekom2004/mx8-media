@@ -67,6 +67,9 @@ pub enum TransformSpec {
         format: String,
         bitrate: String,
     },
+    VideoFilter {
+        expr: String,
+    },
     ImageResize {
         width: u32,
         height: u32,
@@ -80,12 +83,18 @@ pub enum TransformSpec {
         format: String,
         quality: u32,
     },
+    ImageFilter {
+        expr: String,
+    },
     AudioResample {
         rate: u32,
         channels: u32,
     },
     AudioNormalize {
         loudness_lufs: f32,
+    },
+    AudioFilter {
+        expr: String,
     },
 }
 
@@ -126,6 +135,13 @@ impl TransformSpec {
                 }
                 if bitrate.trim().is_empty() {
                     return Err(TransformSpecError::EmptyStringField("bitrate"));
+                }
+            }
+            Self::VideoFilter { expr }
+            | Self::ImageFilter { expr }
+            | Self::AudioFilter { expr } => {
+                if expr.trim().is_empty() {
+                    return Err(TransformSpecError::EmptyStringField("expr"));
                 }
             }
             Self::ImageConvert { format, quality } => {
@@ -486,5 +502,15 @@ mod tests {
             err,
             TransformSpecError::UnsupportedFrameFormat("webp".to_string())
         );
+    }
+
+    #[test]
+    fn video_filter_rejects_empty_expr() {
+        let err = TransformSpec::VideoFilter {
+            expr: "".to_string(),
+        }
+        .validate()
+        .expect_err("expected expr to be required");
+        assert_eq!(err, TransformSpecError::EmptyStringField("expr"));
     }
 }
