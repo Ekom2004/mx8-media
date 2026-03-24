@@ -57,10 +57,9 @@ Optional tuning:
 export MX8_FIND_DISPATCHER_WORKERS=4
 export MX8_FIND_SAMPLE_FPS=1.0
 export MX8_FIND_MODEL=siglip2_base
-export MX8_FIND_QUERY_CACHE_TTL_SECS=1800
-export MX8_FIND_QUERY_CACHE_MAX_ENTRIES=10000
 export MX8_FIND_BATCH_SIZE=16
-export MX8_FIND_SCORE_THRESHOLD=0.25
+export MX8_FIND_SCORE_THRESHOLD=-8.0
+export MX8_FIND_SCORE_MARGIN=2.0
 export MX8_FIND_PAD_BEFORE_MS=500
 export MX8_FIND_PAD_AFTER_MS=1500
 export MX8_FIND_MERGE_GAP_MS=1500
@@ -111,5 +110,5 @@ modal app stop mx8-find-worker --env prod-find
 ## Current limits
 
 - The dispatcher queue is still in-process on the API side.
-- Unbounded assets still start with one initial shard window until duration-aware sharding lands.
+- Long videos now fan out into overlapping scan shards after planner-side duration probing.
 - The worker supports `siglip2_base` today.

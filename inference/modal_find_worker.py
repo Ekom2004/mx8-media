@@ -4,7 +4,6 @@ import os
 import subprocess
 import tempfile
 import threading
-from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import Message
@@ -19,7 +18,7 @@ try:
 except ImportError:  # pragma: no cover - local unit tests may run without Modal installed
     modal = None
 
-_APP_NAME = "mx8-find-worker"
+_APP_NAME = os.getenv("MX8_FIND_MODAL_APP_NAME", "mx8-find-worker")
 _MODEL_CACHE_DIR = Path("/models/hf")
 _MODEL_CACHE_VOLUME_NAME = os.getenv("MX8_FIND_MODAL_HF_CACHE_VOLUME", "mx8-find-hf-cache")
 _REMOTE_MEDIA_EXTENSIONS = {
@@ -41,6 +40,16 @@ _REMOTE_MEDIA_EXTENSIONS = {
 
 if modal is not None:
     _model_cache_volume = modal.Volume.from_name(_MODEL_CACHE_VOLUME_NAME, create_if_missing=True)
+    _runtime_env_secret = modal.Secret.from_dict(
+        {
+            "MX8_FIND_BATCH_SIZE": os.getenv("MX8_FIND_BATCH_SIZE", "16"),
+            "MX8_FIND_SCORE_THRESHOLD": os.getenv("MX8_FIND_SCORE_THRESHOLD", "-8.0"),
+            "MX8_FIND_SCORE_MARGIN": os.getenv("MX8_FIND_SCORE_MARGIN", "2.0"),
+            "MX8_FIND_PAD_BEFORE_MS": os.getenv("MX8_FIND_PAD_BEFORE_MS", "500"),
+            "MX8_FIND_PAD_AFTER_MS": os.getenv("MX8_FIND_PAD_AFTER_MS", "1500"),
+            "MX8_FIND_MERGE_GAP_MS": os.getenv("MX8_FIND_MERGE_GAP_MS", "1500"),
+        }
+    )
     app = modal.App(_APP_NAME)
     image = (
         modal.Image.debian_slim(python_version="3.11")
@@ -239,12 +248,11 @@ class _ModelRuntime:
     model: Any
     device: str
     torch_dtype: Any
+    inference_mode: Any
 
 
 _runtime_lock = threading.Lock()
 _runtime_by_model: dict[str, _ModelRuntime] = {}
-_query_cache_lock = threading.Lock()
-_query_cache: OrderedDict[tuple[str, str], tuple[float, Any]] = OrderedDict()
 
 
 def process_shard_payload(payload: dict[str, object]) -> dict[str, object]:
@@ -260,6 +268,7 @@ if modal is not None:
         gpu=os.getenv("MX8_FIND_MODAL_GPU", "L4"),
         timeout=int(os.getenv("MX8_FIND_MODAL_TIMEOUT_SECS", "3600")),
         volumes={"/models": _model_cache_volume},
+        secrets=[_runtime_env_secret],
     )
     def process_shard(payload: dict[str, object]) -> dict[str, object]:
         return process_shard_payload(payload)
@@ -453,9 +462,7 @@ def _is_supported_media_type(*, content_type: str, source_ref: str, asset_id: st
 def _score_frames(*, shard: FindShard, frame_paths: Sequence[Path], source_ref: str) -> tuple[list[float], int]:
     started = monotonic()
     runtime = _runtime_for_model(shard.model)
-    query_embedding = _cached_query_embedding(runtime=runtime, shard=shard).to(runtime.device)
 
-    import torch
     from PIL import Image
 
     scores: list[float] = []
@@ -465,13 +472,17 @@ def _score_frames(*, shard: FindShard, frame_paths: Sequence[Path], source_ref: 
         for path in batch_paths:
             with Image.open(path) as image:
                 images.append(image.convert("RGB"))
-        inputs = runtime.processor(images=images, return_tensors="pt")
+        inputs = runtime.processor(
+            text=[shard.query_text],
+            images=images,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+        )
         inputs = {name: tensor.to(runtime.device) for name, tensor in inputs.items()}
-        with torch.inference_mode():
-            image_features = runtime.model.get_image_features(**inputs)
-        image_features = image_features.float()
-        image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
-        batch_scores = torch.matmul(image_features, query_embedding.unsqueeze(1)).squeeze(1)
+        with runtime.inference_mode():
+            outputs = runtime.model(**inputs)
+        batch_scores = outputs.logits_per_image.squeeze(-1).float()
         scores.extend(float(score) for score in batch_scores.detach().cpu().tolist())
     return scores, max(0, int((monotonic() - started) * 1000))
 
@@ -483,14 +494,15 @@ def _runtime_for_model(model_alias: str) -> _ModelRuntime:
         if runtime is not None:
             return runtime
 
-        import torch
         from transformers import AutoModel, AutoProcessor
 
         os.environ.setdefault("HF_HOME", str(_MODEL_CACHE_DIR))
         _MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        import torch
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         torch_dtype = torch.float16 if device == "cuda" else torch.float32
-        processor = AutoProcessor.from_pretrained(model_id)
+        processor = AutoProcessor.from_pretrained(model_id, use_fast=False)
         model = AutoModel.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
@@ -502,6 +514,7 @@ def _runtime_for_model(model_alias: str) -> _ModelRuntime:
             model=model,
             device=device,
             torch_dtype=torch_dtype,
+            inference_mode=torch.inference_mode,
         )
         _runtime_by_model[model_id] = runtime
         if _model_cache_volume is not None:  # pragma: no branch - only true on Modal
@@ -510,45 +523,6 @@ def _runtime_for_model(model_alias: str) -> _ModelRuntime:
             except Exception:
                 pass
         return runtime
-
-
-def _cached_query_embedding(*, runtime: _ModelRuntime, shard: FindShard):
-    query_key = (_resolve_model_id(shard.model), shard.query_id)
-    now = monotonic()
-    with _query_cache_lock:
-        _prune_query_cache_locked(now=now)
-        cached = _query_cache.get(query_key)
-        if cached is not None:
-            _query_cache.move_to_end(query_key)
-            return cached[1]
-
-    import torch
-
-    inputs = runtime.processor(text=[shard.query_text], return_tensors="pt")
-    inputs = {name: tensor.to(runtime.device) for name, tensor in inputs.items()}
-    with torch.inference_mode():
-        text_features = runtime.model.get_text_features(**inputs)
-    text_features = text_features.float()
-    text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
-    embedding = text_features[0].detach().cpu()
-
-    with _query_cache_lock:
-        _query_cache[query_key] = (now, embedding)
-        _query_cache.move_to_end(query_key)
-        while len(_query_cache) > _query_cache_max_entries():
-            _query_cache.popitem(last=False)
-    return embedding
-
-
-def _prune_query_cache_locked(*, now: float) -> None:
-    ttl_secs = _query_cache_ttl_secs()
-    expired = [
-        query_key
-        for query_key, (inserted_at, _) in _query_cache.items()
-        if now - inserted_at > ttl_secs
-    ]
-    for query_key in expired:
-        _query_cache.pop(query_key, None)
 
 
 def _merge_frame_hits(
@@ -560,7 +534,7 @@ def _merge_frame_hits(
     frame_times_ms: Sequence[int],
     scores: Sequence[float],
 ) -> tuple[MatchSegment, ...]:
-    threshold = _score_threshold()
+    threshold = _match_threshold(scores)
     pad_before_ms = _pad_before_ms()
     pad_after_ms = _pad_after_ms()
     merge_gap_ms = _merge_gap_ms()
@@ -588,6 +562,12 @@ def _merge_frame_hits(
     return tuple(merged)
 
 
+def _match_threshold(scores: Sequence[float]) -> float:
+    if not scores:
+        return _score_threshold()
+    return max(_score_threshold(), max(scores) - _score_margin())
+
+
 def _resolve_model_id(model_alias: str) -> str:
     normalized = model_alias.strip().lower()
     if "/" in model_alias:
@@ -604,20 +584,16 @@ def _frame_step_ms(sample_fps: float) -> int:
     return max(1, int(round(1000.0 / max(sample_fps, 0.001))))
 
 
-def _query_cache_ttl_secs() -> float:
-    return max(1.0, float(os.getenv("MX8_FIND_QUERY_CACHE_TTL_SECS", "1800")))
-
-
-def _query_cache_max_entries() -> int:
-    return max(1, int(os.getenv("MX8_FIND_QUERY_CACHE_MAX_ENTRIES", "10000")))
-
-
 def _batch_size() -> int:
     return max(1, int(os.getenv("MX8_FIND_BATCH_SIZE", "16")))
 
 
 def _score_threshold() -> float:
-    return float(os.getenv("MX8_FIND_SCORE_THRESHOLD", "0.25"))
+    return float(os.getenv("MX8_FIND_SCORE_THRESHOLD", "-8.0"))
+
+
+def _score_margin() -> float:
+    return float(os.getenv("MX8_FIND_SCORE_MARGIN", "2.0"))
 
 
 def _pad_before_ms() -> int:

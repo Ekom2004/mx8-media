@@ -18,6 +18,7 @@ from api.find_dispatcher import (
     FindDispatcher,
     FindShardQueue,
     MockFindTransport,
+    _parse_duration_secs,
     build_find_shards,
     validate_remote_probe_response,
 )
@@ -227,6 +228,11 @@ class DispatcherTests(unittest.TestCase):
             headers=headers,
             source_ref="https://example.com/video.mp4",
         )
+
+    def test_parse_duration_secs_accepts_native_float(self) -> None:
+        self.assertEqual(_parse_duration_secs(12.5), 12.5)
+        self.assertIsNone(_parse_duration_secs(float("nan")))
+        self.assertIsNone(_parse_duration_secs(0.0))
 
 
 if __name__ == "__main__":

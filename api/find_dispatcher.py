@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import threading
@@ -863,7 +864,7 @@ def _parse_duration_secs(value: object) -> float | None:
         parsed = float(str(value))
     except (TypeError, ValueError):
         return None
-    if not parsed.is_finite() or parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         return None
     return parsed
 
