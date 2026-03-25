@@ -113,6 +113,40 @@ struct AudioStreamMetadata {
     channels: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SampleExecutionPlan {
+    source_location: String,
+    segment_start_ms: Option<u64>,
+    segment_end_ms: Option<u64>,
+}
+
+impl SampleExecutionPlan {
+    fn full(source_location: &str) -> Self {
+        Self {
+            source_location: source_location.to_string(),
+            segment_start_ms: None,
+            segment_end_ms: None,
+        }
+    }
+
+    fn from_record(record: &ManifestRecord) -> Self {
+        Self {
+            source_location: record.location.clone(),
+            segment_start_ms: record.segment_start_ms,
+            segment_end_ms: record.segment_end_ms,
+        }
+    }
+
+    fn segment_label(&self, sample_id: u64) -> Option<String> {
+        match (self.segment_start_ms, self.segment_end_ms) {
+            (Some(start_ms), Some(end_ms)) => {
+                Some(format!("segment_{sample_id:06}_{start_ms}_{end_ms}"))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Parser, Clone)]
 #[command(name = "mx8d-agent")]
 struct Args {
@@ -311,7 +345,7 @@ struct JobSpecSink {
     sleep: Duration,
     cancelled: Arc<AtomicBool>,
     job_spec: Arc<CoreJobSpec>,
-    source_locations: Arc<HashMap<u64, String>>,
+    sample_plans: Arc<HashMap<u64, SampleExecutionPlan>>,
     transform_slots: Arc<TransformProcessLimiter>,
     #[cfg(feature = "s3")]
     s3_client: Arc<S3Client>,
@@ -343,13 +377,13 @@ impl Sink for JobSpecSink {
 
         let mut first_output_uri: Option<String> = None;
         for (idx, sample_id) in batch.sample_ids.iter().copied().enumerate() {
-            let source_location = self.source_locations.get(&sample_id).ok_or_else(|| {
-                anyhow::anyhow!("missing source location for sample_id={sample_id}")
+            let sample_plan = self.sample_plans.get(&sample_id).ok_or_else(|| {
+                anyhow::anyhow!("missing sample execution plan for sample_id={sample_id}")
             })?;
             let payload = sample_payload_bytes(&batch, idx)?;
-            let artifacts = render_outputs_for_sink(
+            let artifacts = render_outputs_for_sink_with_plan(
                 &self.job_spec,
-                source_location,
+                sample_plan,
                 sample_id,
                 payload,
                 Some(&self.transform_slots),
@@ -608,11 +642,11 @@ fn local_source_path(location: &str) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
-fn build_source_locations(
+fn build_sample_plans(
     records: &[ManifestRecord],
     job_spec: Option<&CoreJobSpec>,
-) -> Result<HashMap<u64, String>> {
-    let mut locations = HashMap::with_capacity(records.len());
+) -> Result<HashMap<u64, SampleExecutionPlan>> {
+    let mut plans = HashMap::with_capacity(records.len());
     for record in records {
         if let Some(spec) = job_spec {
             if !source_matches_job(&spec.source_uri, record) {
@@ -623,45 +657,53 @@ fn build_source_locations(
                 );
             }
         }
-        locations.insert(record.sample_id, record.location.clone());
+        plans.insert(record.sample_id, SampleExecutionPlan::from_record(record));
     }
-    Ok(locations)
+    Ok(plans)
 }
 
-fn plan_output_uri(
+fn plan_output_uri_with_plan(
     job_spec: &CoreJobSpec,
-    source_location: &str,
+    sample_plan: &SampleExecutionPlan,
     sample_id: u64,
 ) -> Result<String> {
     validate_sink_uri(&job_spec.sink_uri)?;
-    let base_name = source_basename_without_extension(source_location)
+    let base_name = source_basename_without_extension(&sample_plan.source_location)
         .unwrap_or_else(|| format!("sample_{sample_id}"));
     let transform_tag = transform_tag(&job_spec.transforms);
-    let extension = output_extension(&job_spec.transforms, source_location);
+    let extension = output_extension(&job_spec.transforms, &sample_plan.source_location);
+    let stem = if let Some(segment_label) = sample_plan.segment_label(sample_id) {
+        format!("{base_name}_{segment_label}_{transform_tag}")
+    } else {
+        format!("{base_name}_{transform_tag}")
+    };
     Ok(format!(
-        "{}/{}_{}.{}",
+        "{}/{}.{}",
         job_spec.sink_uri.trim_end_matches('/'),
-        base_name,
-        transform_tag,
+        stem,
         extension
     ))
 }
 
-fn plan_frame_output_uri(
+fn plan_frame_output_uri_with_plan(
     job_spec: &CoreJobSpec,
-    source_location: &str,
+    sample_plan: &SampleExecutionPlan,
     sample_id: u64,
     frame_index: usize,
 ) -> Result<String> {
     validate_sink_uri(&job_spec.sink_uri)?;
-    let base_name = source_basename_without_extension(source_location)
+    let base_name = source_basename_without_extension(&sample_plan.source_location)
         .unwrap_or_else(|| format!("sample_{sample_id}"));
-    let extension = output_extension(&job_spec.transforms, source_location);
+    let extension = output_extension(&job_spec.transforms, &sample_plan.source_location);
+    let stem = if let Some(segment_label) = sample_plan.segment_label(sample_id) {
+        format!("{base_name}_{segment_label}_frames_{frame_index:06}")
+    } else {
+        format!("{base_name}_frames_{frame_index:06}")
+    };
     Ok(format!(
-        "{}/{}_frames_{:06}.{}",
+        "{}/{}.{}",
         job_spec.sink_uri.trim_end_matches('/'),
-        base_name,
-        frame_index,
+        stem,
         extension
     ))
 }
@@ -690,15 +732,17 @@ fn transform_payload_for_sink(
     source_location: &str,
     payload: &[u8],
 ) -> Result<Vec<u8>> {
-    transform_payload_for_sink_with_slots(job_spec, source_location, payload, None)
+    let sample_plan = SampleExecutionPlan::full(source_location);
+    transform_payload_for_sink_with_slots(job_spec, &sample_plan, payload, None)
 }
 
 fn transform_payload_for_sink_with_slots(
     job_spec: &CoreJobSpec,
-    source_location: &str,
+    sample_plan: &SampleExecutionPlan,
     payload: &[u8],
     transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<u8>> {
+    let source_location = sample_plan.source_location.as_str();
     job_spec.validate()?;
 
     if job_spec.transforms.is_empty() {
@@ -708,7 +752,7 @@ fn transform_payload_for_sink_with_slots(
     if video_extract_audio_spec(&job_spec.transforms).is_some() {
         return transform_video_extract_audio_chain_payload_for_sink(
             job_spec,
-            source_location,
+            sample_plan,
             payload,
             transform_slots,
         );
@@ -719,12 +763,7 @@ fn transform_payload_for_sink_with_slots(
     }
 
     if job_spec.transforms.iter().all(is_video_transform) {
-        return transform_video_payload_for_sink(
-            job_spec,
-            source_location,
-            payload,
-            transform_slots,
-        );
+        return transform_video_payload_for_sink(job_spec, sample_plan, payload, transform_slots);
     }
 
     if job_spec.transforms.iter().all(is_audio_transform) {
@@ -748,21 +787,32 @@ fn render_outputs_for_sink(
     payload: &[u8],
     transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<SinkArtifact>> {
+    let sample_plan = SampleExecutionPlan::full(source_location);
+    render_outputs_for_sink_with_plan(job_spec, &sample_plan, sample_id, payload, transform_slots)
+}
+
+fn render_outputs_for_sink_with_plan(
+    job_spec: &CoreJobSpec,
+    sample_plan: &SampleExecutionPlan,
+    sample_id: u64,
+    payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
+) -> Result<Vec<SinkArtifact>> {
     job_spec.validate()?;
 
     if video_extract_frames_spec(&job_spec.transforms).is_some() {
         return render_video_extract_frame_chain_outputs_for_sink(
             job_spec,
-            source_location,
+            sample_plan,
             sample_id,
             payload,
             transform_slots,
         );
     }
 
-    let output_uri = plan_output_uri(job_spec, source_location, sample_id)?;
+    let output_uri = plan_output_uri_with_plan(job_spec, sample_plan, sample_id)?;
     let transformed =
-        transform_payload_for_sink_with_slots(job_spec, source_location, payload, transform_slots)?;
+        transform_payload_for_sink_with_slots(job_spec, sample_plan, payload, transform_slots)?;
     Ok(vec![SinkArtifact {
         output_uri,
         payload: transformed,
@@ -851,14 +901,15 @@ fn transform_image_payload_for_sink(
 
 fn transform_video_payload_for_sink(
     job_spec: &CoreJobSpec,
-    source_location: &str,
+    sample_plan: &SampleExecutionPlan,
     payload: &[u8],
     transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<u8>> {
+    let source_location = sample_plan.source_location.as_str();
     if video_extract_audio_spec(&job_spec.transforms).is_some() {
         return transform_video_extract_audio_chain_payload_for_sink(
             job_spec,
-            source_location,
+            sample_plan,
             payload,
             transform_slots,
         );
@@ -866,6 +917,7 @@ fn transform_video_payload_for_sink(
 
     let mut command = Command::new("ffmpeg");
     command.arg("-hide_banner").arg("-loglevel").arg("error");
+    append_segment_window_args(&mut command, sample_plan)?;
 
     if let Some(filter_chain) = video_filter_chain(&job_spec.transforms) {
         command.arg("-vf").arg(filter_chain);
@@ -946,7 +998,7 @@ fn transform_audio_payload_for_sink(
 
 fn transform_video_extract_audio_chain_payload_for_sink(
     job_spec: &CoreJobSpec,
-    source_location: &str,
+    sample_plan: &SampleExecutionPlan,
     payload: &[u8],
     transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<u8>> {
@@ -956,23 +1008,25 @@ fn transform_video_extract_audio_chain_payload_for_sink(
     }
 
     let extracted =
-        extract_audio_payload_for_sink(job_spec, source_location, payload, transform_slots)?;
+        extract_audio_payload_for_sink(job_spec, sample_plan, payload, transform_slots)?;
     let audio_tail = &job_spec.transforms[extract_index + 1..];
     if audio_tail.is_empty() {
         return Ok(extracted);
     }
 
     let chained_spec = job_spec_with_transforms(job_spec, audio_tail.to_vec());
-    let chained_source = synthesized_media_location(source_location, extracted_format);
+    let chained_source =
+        synthesized_media_location(sample_plan.source_location.as_str(), extracted_format);
     transform_audio_payload_for_sink(&chained_spec, &chained_source, &extracted, transform_slots)
 }
 
 fn extract_audio_payload_for_sink(
     job_spec: &CoreJobSpec,
-    source_location: &str,
+    sample_plan: &SampleExecutionPlan,
     payload: &[u8],
     transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<u8>> {
+    let source_location = sample_plan.source_location.as_str();
     let (format, bitrate) = match video_extract_audio_spec(&job_spec.transforms) {
         Some(TransformSpec::VideoExtractAudio { format, bitrate }) => {
             (format.as_str(), bitrate.as_str())
@@ -981,11 +1035,9 @@ fn extract_audio_payload_for_sink(
     };
 
     let mut command = Command::new("ffmpeg");
-    command
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-vn");
+    command.arg("-hide_banner").arg("-loglevel").arg("error");
+    append_segment_window_args(&mut command, sample_plan)?;
+    command.arg("-vn");
 
     let codec = ffmpeg_audio_codec(format)?;
     command.arg("-c:a").arg(codec);
@@ -1009,7 +1061,7 @@ fn extract_audio_payload_for_sink(
 
 fn extract_frame_outputs_for_sink(
     job_spec: &CoreJobSpec,
-    source_location: &str,
+    sample_plan: &SampleExecutionPlan,
     sample_id: u64,
     payload: &[u8],
     transform_slots: Option<&Arc<TransformProcessLimiter>>,
@@ -1023,12 +1075,9 @@ fn extract_frame_outputs_for_sink(
         .to_string();
 
     let mut command = Command::new("ffmpeg");
-    command
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-vf")
-        .arg(format!("fps={fps}"));
+    command.arg("-hide_banner").arg("-loglevel").arg("error");
+    append_segment_window_args(&mut command, sample_plan)?;
+    command.arg("-vf").arg(format!("fps={fps}"));
     if normalize_frame_format(format) == Some("jpg") {
         command.arg("-q:v").arg("2");
     }
@@ -1042,21 +1091,25 @@ fn extract_frame_outputs_for_sink(
     let output = run_ffmpeg_stdout(
         command,
         payload,
-        source_location,
+        sample_plan.source_location.as_str(),
         "frame extract",
         transform_slots,
         FfmpegInputMode::SeekableFile,
     )?;
     let frames = split_frame_stream(&output, &frame_extension)?;
     if frames.is_empty() {
-        anyhow::bail!("ffmpeg frame extract produced no outputs for {source_location}");
+        anyhow::bail!(
+            "ffmpeg frame extract produced no outputs for {}",
+            sample_plan.source_location
+        );
     }
 
     frames
         .into_iter()
         .enumerate()
         .map(|(index, payload)| {
-            let output_uri = plan_frame_output_uri(job_spec, source_location, sample_id, index)?;
+            let output_uri =
+                plan_frame_output_uri_with_plan(job_spec, sample_plan, sample_id, index)?;
             Ok(SinkArtifact {
                 output_uri,
                 payload,
@@ -1067,7 +1120,7 @@ fn extract_frame_outputs_for_sink(
 
 fn render_video_extract_frame_chain_outputs_for_sink(
     job_spec: &CoreJobSpec,
-    source_location: &str,
+    sample_plan: &SampleExecutionPlan,
     sample_id: u64,
     payload: &[u8],
     transform_slots: Option<&Arc<TransformProcessLimiter>>,
@@ -1077,13 +1130,8 @@ fn render_video_extract_frame_chain_outputs_for_sink(
         anyhow::bail!("video.extract_frames must be the first transform in the chain");
     }
 
-    let extracted_frames = extract_frame_outputs_for_sink(
-        job_spec,
-        source_location,
-        sample_id,
-        payload,
-        transform_slots,
-    )?;
+    let extracted_frames =
+        extract_frame_outputs_for_sink(job_spec, sample_plan, sample_id, payload, transform_slots)?;
     let image_tail = &job_spec.transforms[extract_index + 1..];
     if image_tail.is_empty() {
         return Ok(extracted_frames);
@@ -1105,6 +1153,36 @@ fn render_video_extract_frame_chain_outputs_for_sink(
             })
         })
         .collect()
+}
+
+fn append_segment_window_args(
+    command: &mut Command,
+    sample_plan: &SampleExecutionPlan,
+) -> Result<()> {
+    match (sample_plan.segment_start_ms, sample_plan.segment_end_ms) {
+        (Some(start_ms), Some(end_ms)) => {
+            if end_ms <= start_ms {
+                anyhow::bail!(
+                    "segment_end_ms must be > segment_start_ms for {}",
+                    sample_plan.source_location
+                );
+            }
+            command.arg("-ss").arg(ffmpeg_time_arg(start_ms));
+            command.arg("-t").arg(ffmpeg_time_arg(end_ms - start_ms));
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => anyhow::bail!(
+            "segment_start_ms and segment_end_ms must both be set for {}",
+            sample_plan.source_location
+        ),
+    }
+}
+
+fn ffmpeg_time_arg(total_ms: u64) -> String {
+    let seconds = total_ms / 1_000;
+    let milliseconds = total_ms % 1_000;
+    format!("{seconds}.{milliseconds:03}")
 }
 
 fn video_filter_chain(transforms: &[TransformSpec]) -> Option<String> {
@@ -1950,7 +2028,7 @@ async fn run_lease(
         metrics,
     )
     .await?;
-    let source_locations = Arc::new(build_source_locations(&records, job_spec.as_deref())?);
+    let sample_plans = Arc::new(build_sample_plans(&records, job_spec.as_deref())?);
 
     metrics.leases_started_total.inc();
     tracing::info!(
@@ -1997,7 +2075,7 @@ async fn run_lease(
             sleep: Duration::from_millis(args.sink_sleep_ms),
             cancelled: cancelled.clone(),
             job_spec,
-            source_locations,
+            sample_plans,
             transform_slots,
             #[cfg(feature = "s3")]
             s3_client,
@@ -2412,9 +2490,10 @@ async fn main() -> Result<()> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        normalized_image_extension, output_extension, render_outputs_for_sink, run_lease,
-        transform_payload_for_sink, AgentMetrics, Args, CoreJobSpec, ManifestSource,
-        TransformProcessLimiter, TransformSpec,
+        normalized_image_extension, output_extension, render_outputs_for_sink,
+        render_outputs_for_sink_with_plan, run_lease, transform_payload_for_sink, AgentMetrics,
+        Args, CoreJobSpec, ManifestSource, SampleExecutionPlan, TransformProcessLimiter,
+        TransformSpec,
     };
     use image::{DynamicImage, GenericImageView, ImageFormat};
     use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
@@ -2431,6 +2510,7 @@ mod tests {
     use std::pin::Pin;
     use std::process::Command;
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_stream::Stream;
     use tonic::transport::{Channel, Server};
@@ -2720,6 +2800,28 @@ mod tests {
             .parse::<u32>()
             .expect("height parse");
         (width, height, codec)
+    }
+
+    fn ffprobe_media_duration_secs(path: &Path) -> f64 {
+        let output = Command::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-show_entries")
+            .arg("format=duration")
+            .arg("-of")
+            .arg("default=noprint_wrappers=1:nokey=1")
+            .arg(path)
+            .output()
+            .expect("run ffprobe");
+        assert!(output.status.success(), "ffprobe failed");
+        String::from_utf8(output.stdout)
+            .expect("ffprobe output utf8")
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .expect("duration")
+            .parse::<f64>()
+            .expect("duration parse")
     }
 
     fn ffprobe_audio_stream(path: &Path) -> String {
@@ -3045,6 +3147,54 @@ mod tests {
     }
 
     #[test]
+    fn video_transcode_honors_segment_window_and_names_output_with_segment_identity() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("video-transcode-segment");
+        let input_path = root.join("input.mp4");
+        let output_path = root.join("segment.mp4");
+        write_ffmpeg_test_video_custom(&input_path, 1280, 720, 4, "30");
+        let payload = std::fs::read(&input_path).expect("read input video");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::VideoTranscode {
+                codec: "h264".to_string(),
+                crf: 23,
+            }],
+        };
+        let sample_plan = SampleExecutionPlan {
+            source_location: "s3://in/sample.mp4".to_string(),
+            segment_start_ms: Some(1_000),
+            segment_end_ms: Some(2_000),
+        };
+
+        let artifacts =
+            render_outputs_for_sink_with_plan(&spec, &sample_plan, 21, payload.as_slice(), None)
+                .expect("render outputs");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].output_uri,
+            "s3://out/sample_segment_000021_1000_2000_transcode.mp4"
+        );
+        std::fs::write(&output_path, &artifacts[0].payload).expect("write output video");
+        let (width, height, codec) = ffprobe_video_stream(&output_path);
+        assert_eq!((width, height), (1280, 720));
+        assert_eq!(codec, "h264");
+        let duration_secs = ffprobe_media_duration_secs(&output_path);
+        assert!(
+            (duration_secs - 1.0).abs() < 0.25,
+            "expected ~1s segment output, got {duration_secs}s"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn video_extract_audio_emits_wav_output() {
         if !video_tools_available() {
             return;
@@ -3189,6 +3339,98 @@ mod tests {
     }
 
     #[test]
+    fn video_extract_frames_honors_segment_window_and_names_outputs_with_segment_identity() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("video-extract-frames-segment");
+        let input_path = root.join("input.mp4");
+        write_ffmpeg_test_video_custom(&input_path, 64, 64, 4, "2");
+        let payload = std::fs::read(&input_path).expect("read input video");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::VideoExtractFrames {
+                fps: 2.0,
+                format: "jpg".to_string(),
+            }],
+        };
+        let sample_plan = SampleExecutionPlan {
+            source_location: "s3://in/sample.mp4".to_string(),
+            segment_start_ms: Some(1_000),
+            segment_end_ms: Some(2_000),
+        };
+
+        let artifacts =
+            render_outputs_for_sink_with_plan(&spec, &sample_plan, 12, payload.as_slice(), None)
+                .expect("render outputs");
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(
+            artifacts[0].output_uri,
+            "s3://out/sample_segment_000012_1000_2000_frames_000000.jpg"
+        );
+        assert!(artifacts
+            .iter()
+            .all(|artifact| artifact.output_uri.contains("segment_000012_1000_2000")));
+        assert!(artifacts
+            .iter()
+            .all(|artifact| artifact.payload.starts_with(&[0xFF, 0xD8, 0xFF])));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_extract_frames_segment_outputs_do_not_collide_for_same_source() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("video-extract-frames-segment-collision");
+        let input_path = root.join("input.mp4");
+        write_ffmpeg_test_video_custom(&input_path, 64, 64, 4, "2");
+        let payload = std::fs::read(&input_path).expect("read input video");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::VideoExtractFrames {
+                fps: 2.0,
+                format: "jpg".to_string(),
+            }],
+        };
+
+        let first_plan = SampleExecutionPlan {
+            source_location: "s3://in/sample.mp4".to_string(),
+            segment_start_ms: Some(0),
+            segment_end_ms: Some(1_000),
+        };
+        let second_plan = SampleExecutionPlan {
+            source_location: "s3://in/sample.mp4".to_string(),
+            segment_start_ms: Some(2_000),
+            segment_end_ms: Some(3_000),
+        };
+
+        let first =
+            render_outputs_for_sink_with_plan(&spec, &first_plan, 3, payload.as_slice(), None)
+                .expect("first render");
+        let second =
+            render_outputs_for_sink_with_plan(&spec, &second_plan, 4, payload.as_slice(), None)
+                .expect("second render");
+
+        assert!(!first.is_empty());
+        assert!(!second.is_empty());
+        assert_ne!(first[0].output_uri, second[0].output_uri);
+        assert!(first[0].output_uri.contains("segment_000003_0_1000"));
+        assert!(second[0].output_uri.contains("segment_000004_2000_3000"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn video_extract_frames_then_image_resize_emits_resized_outputs() {
         if !video_tools_available() {
             return;
@@ -3225,6 +3467,213 @@ mod tests {
             assert!(artifact.payload.starts_with(&[0xFF, 0xD8, 0xFF]));
             let decoded = image::load_from_memory(&artifact.payload).expect("decode resized frame");
             assert_eq!(decoded.dimensions(), (16, 16));
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn profile_video_extract_frames_transform_throughput() {
+        if !video_tools_available() {
+            return;
+        }
+
+        for duration_secs in [60_u32, 120_u32] {
+            let root = temp_test_dir(&format!("video-extract-frames-bench-{duration_secs}"));
+            let input_path = root.join("input.mp4");
+            let output_root = root.join("out");
+            write_ffmpeg_test_video_custom(&input_path, 1280, 720, duration_secs, "30");
+            let payload = std::fs::read(&input_path).expect("read input video");
+            let spec = CoreJobSpec {
+                job_id: "job".to_string(),
+                source_uri: "file:///input".to_string(),
+                sink_uri: format!("file://{}", output_root.display()),
+                aws_region: "us-east-1".to_string(),
+                transforms: vec![TransformSpec::VideoExtractFrames {
+                    fps: 1.0,
+                    format: "jpg".to_string(),
+                }],
+            };
+
+            let render_started = Instant::now();
+            let artifacts = render_outputs_for_sink(
+                &spec,
+                "file:///input/sample.mp4",
+                1,
+                payload.as_slice(),
+                None,
+            )
+            .expect("render outputs");
+            let render_elapsed = render_started.elapsed();
+
+            let artifact_count = artifacts.len();
+            let output_bytes: usize = artifacts
+                .iter()
+                .map(|artifact| artifact.payload.len())
+                .sum();
+
+            let write_started = Instant::now();
+            for artifact in &artifacts {
+                let path = super::parse_file_uri(&artifact.output_uri).expect("parse file uri");
+                super::write_file_output(&path, &artifact.payload).expect("write file output");
+            }
+            let write_elapsed = write_started.elapsed();
+
+            let total_elapsed = render_elapsed + write_elapsed;
+            let realtime_multiple = duration_secs as f64 / total_elapsed.as_secs_f64();
+            let outputs_per_sec = artifact_count as f64 / total_elapsed.as_secs_f64();
+
+            println!(
+                "extract_frames_transform duration={}s outputs={} output_bytes={} render_ms={} write_ms={} total_ms={} realtime_x={:.2} outputs_per_sec={:.2}",
+                duration_secs,
+                artifact_count,
+                output_bytes,
+                render_elapsed.as_millis(),
+                write_elapsed.as_millis(),
+                total_elapsed.as_millis(),
+                realtime_multiple,
+                outputs_per_sec,
+            );
+
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn profile_video_transcode_transform_throughput() {
+        if !video_tools_available() {
+            return;
+        }
+
+        for duration_secs in [60_u32, 120_u32] {
+            let root = temp_test_dir(&format!("video-transcode-bench-{duration_secs}"));
+            let input_path = root.join("input.mp4");
+            let output_root = root.join("out");
+            write_ffmpeg_test_video_custom(&input_path, 1280, 720, duration_secs, "30");
+            let payload = std::fs::read(&input_path).expect("read input video");
+            let spec = CoreJobSpec {
+                job_id: "job".to_string(),
+                source_uri: "file:///input".to_string(),
+                sink_uri: format!("file://{}", output_root.display()),
+                aws_region: "us-east-1".to_string(),
+                transforms: vec![TransformSpec::VideoTranscode {
+                    codec: "h264".to_string(),
+                    crf: 23,
+                }],
+            };
+
+            let render_started = Instant::now();
+            let artifacts = render_outputs_for_sink(
+                &spec,
+                "file:///input/sample.mp4",
+                1,
+                payload.as_slice(),
+                None,
+            )
+            .expect("render outputs");
+            let render_elapsed = render_started.elapsed();
+
+            let artifact_count = artifacts.len();
+            let output_bytes: usize = artifacts
+                .iter()
+                .map(|artifact| artifact.payload.len())
+                .sum();
+
+            let write_started = Instant::now();
+            for artifact in &artifacts {
+                let path = super::parse_file_uri(&artifact.output_uri).expect("parse file uri");
+                super::write_file_output(&path, &artifact.payload).expect("write file output");
+            }
+            let write_elapsed = write_started.elapsed();
+
+            let total_elapsed = render_elapsed + write_elapsed;
+            let realtime_multiple = duration_secs as f64 / total_elapsed.as_secs_f64();
+
+            println!(
+                "video_transcode_transform duration={}s outputs={} output_bytes={} render_ms={} write_ms={} total_ms={} realtime_x={:.2}",
+                duration_secs,
+                artifact_count,
+                output_bytes,
+                render_elapsed.as_millis(),
+                write_elapsed.as_millis(),
+                total_elapsed.as_millis(),
+                realtime_multiple,
+            );
+
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn profile_video_segment_export_transform_throughput() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let input_duration_secs = 150_u32;
+        let root = temp_test_dir("video-segment-export-bench");
+        let input_path = root.join("input.mp4");
+        let output_root = root.join("out");
+        write_ffmpeg_test_video_custom(&input_path, 1280, 720, input_duration_secs, "30");
+        let payload = std::fs::read(&input_path).expect("read input video");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "file:///input".to_string(),
+            sink_uri: format!("file://{}", output_root.display()),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::VideoTranscode {
+                codec: "h264".to_string(),
+                crf: 23,
+            }],
+        };
+
+        for clip_duration_secs in [20_u32, 60_u32] {
+            let sample_plan = SampleExecutionPlan {
+                source_location: "file:///input/sample.mp4".to_string(),
+                segment_start_ms: Some(10_000),
+                segment_end_ms: Some(10_000 + (clip_duration_secs as u64 * 1_000)),
+            };
+
+            let render_started = Instant::now();
+            let artifacts = render_outputs_for_sink_with_plan(
+                &spec,
+                &sample_plan,
+                clip_duration_secs as u64,
+                payload.as_slice(),
+                None,
+            )
+            .expect("render outputs");
+            let render_elapsed = render_started.elapsed();
+
+            let artifact_count = artifacts.len();
+            let output_bytes: usize = artifacts
+                .iter()
+                .map(|artifact| artifact.payload.len())
+                .sum();
+
+            let write_started = Instant::now();
+            for artifact in &artifacts {
+                let path = super::parse_file_uri(&artifact.output_uri).expect("parse file uri");
+                super::write_file_output(&path, &artifact.payload).expect("write file output");
+            }
+            let write_elapsed = write_started.elapsed();
+
+            let total_elapsed = render_elapsed + write_elapsed;
+            let realtime_multiple = clip_duration_secs as f64 / total_elapsed.as_secs_f64();
+
+            println!(
+                "video_segment_export_transform clip_duration={}s outputs={} output_bytes={} render_ms={} write_ms={} total_ms={} realtime_x={:.2}",
+                clip_duration_secs,
+                artifact_count,
+                output_bytes,
+                render_elapsed.as_millis(),
+                write_elapsed.as_millis(),
+                total_elapsed.as_millis(),
+                realtime_multiple,
+            );
         }
 
         let _ = std::fs::remove_dir_all(root);
