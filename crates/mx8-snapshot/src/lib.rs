@@ -131,6 +131,8 @@ impl SourceResolverRegistry {
         let mut out = Self::default();
         out.register(Arc::new(S3PrefixSourceResolver));
         out.register(Arc::new(LocalDirectorySourceResolver));
+        out.register(Arc::new(HttpSourceResolver::new("http")));
+        out.register(Arc::new(HttpSourceResolver::new("https")));
         out.register(Arc::new(HfSourceResolver));
         out
     }
@@ -645,6 +647,165 @@ impl SourceResolver for LocalDirectorySourceResolver {
     }
 }
 
+struct HttpSourceResolver {
+    scheme_name: &'static str,
+}
+
+impl HttpSourceResolver {
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn new(scheme_name: &'static str) -> Self {
+        Self { scheme_name }
+    }
+
+    fn http_agent() -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Self::DEFAULT_TIMEOUT)
+            .timeout_read(Self::DEFAULT_TIMEOUT)
+            .timeout_write(Self::DEFAULT_TIMEOUT)
+            .build()
+    }
+
+    fn manifest_url_for_base(base: &str) -> String {
+        let (prefix, suffix) = split_url_suffix(base);
+        if prefix.ends_with("/manifest") {
+            return format!("{prefix}{suffix}");
+        }
+        format!("{}/manifest{suffix}", prefix.trim_end_matches('/'))
+    }
+
+    fn try_index_manifest_endpoint(
+        &self,
+        base: &str,
+        materialize_manifest_bytes: bool,
+    ) -> Result<Option<IndexedManifest>, SnapshotError> {
+        let manifest_url = Self::manifest_url_for_base(base);
+        let resp = match Self::http_agent().get(&manifest_url).call() {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(status, _)) if status == 404 => return Ok(None),
+            Err(ureq::Error::Status(status, _)) => {
+                return Err(SnapshotError::IndexIo(format!(
+                    "http manifest endpoint returned status {status}: {manifest_url}"
+                )));
+            }
+            Err(ureq::Error::Transport(err)) => {
+                return Err(SnapshotError::IndexIo(format!(
+                    "http manifest endpoint transport error: {manifest_url}: {err}"
+                )));
+            }
+        };
+        let manifest_text = resp.into_string().map_err(|e| {
+            SnapshotError::IndexIo(format!(
+                "read http manifest endpoint failed: {manifest_url}: {e}"
+            ))
+        })?;
+        let bytes = manifest_text.into_bytes();
+        let (records, canonical_bytes) = parse_canonical_manifest_tsv_bytes(&bytes)?;
+        Ok(Some(indexed_manifest_from_bytes(
+            records,
+            canonical_bytes,
+            materialize_manifest_bytes,
+        )?))
+    }
+
+    fn index_single_object(
+        &self,
+        base: &str,
+        materialize_manifest_bytes: bool,
+    ) -> Result<IndexedManifest, SnapshotError> {
+        self.preflight_object(base)?;
+        let record = ManifestRecord {
+            sample_id: 0,
+            location: base.to_string(),
+            byte_offset: None,
+            byte_length: None,
+            decode_hint: None,
+            segment_start_ms: None,
+            segment_end_ms: None,
+        };
+        record
+            .validate()
+            .map_err(|e| SnapshotError::IndexParse(format!("indexed http record invalid: {e}")))?;
+        let canonical_bytes = canonicalize_manifest_bytes(&[record]);
+        indexed_manifest_from_bytes(Vec::new(), canonical_bytes, materialize_manifest_bytes)
+    }
+
+    fn preflight_object(&self, base: &str) -> Result<(), SnapshotError> {
+        let resp = match Self::http_agent()
+            .get(base)
+            .set("Range", "bytes=0-0")
+            .call()
+        {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(status, _)) => {
+                return Err(SnapshotError::IndexUnsupported(format!(
+                    "{base} (http object probe returned status {status})"
+                )));
+            }
+            Err(ureq::Error::Transport(err)) => {
+                return Err(SnapshotError::IndexUnsupported(format!(
+                    "{base} (http object probe transport error: {err})"
+                )));
+            }
+        };
+
+        let supports_ranges = resp.status() == 206
+            || resp
+                .header("Accept-Ranges")
+                .map(|value| value.eq_ignore_ascii_case("bytes"))
+                .unwrap_or(false);
+        if !supports_ranges {
+            return Err(SnapshotError::IndexUnsupported(format!(
+                "{base} (http source must support byte ranges)"
+            )));
+        }
+
+        if let Some(content_type) = resp.header("Content-Type") {
+            let normalized = content_type
+                .split(';')
+                .next()
+                .unwrap_or(content_type)
+                .trim()
+                .to_ascii_lowercase();
+            let supported = normalized.starts_with("video/")
+                || normalized.starts_with("audio/")
+                || normalized.starts_with("image/")
+                || normalized == "application/octet-stream"
+                || normalized == "binary/octet-stream";
+            if !supported {
+                return Err(SnapshotError::IndexUnsupported(format!(
+                    "{base} (unsupported http content-type {normalized})"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SourceResolver for HttpSourceResolver {
+    fn scheme(&self) -> &'static str {
+        self.scheme_name
+    }
+
+    fn index_manifest(
+        &self,
+        base: &str,
+        _recursive: bool,
+        materialize_manifest_bytes: bool,
+    ) -> Result<IndexedManifest, SnapshotError> {
+        let (prefix, _) = split_url_suffix(base);
+        let looks_like_manifest = prefix.ends_with("/manifest") || prefix.ends_with(".tsv");
+        if looks_like_manifest || !url_path_looks_like_file(prefix) {
+            if let Some(indexed) =
+                self.try_index_manifest_endpoint(base, materialize_manifest_bytes)?
+            {
+                return Ok(indexed);
+            }
+        }
+        self.index_single_object(base, materialize_manifest_bytes)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HfRepoKind {
     Model,
@@ -829,6 +990,29 @@ fn hf_token_from_env() -> Option<String> {
         }
     }
     None
+}
+
+fn split_url_suffix(url: &str) -> (&str, &str) {
+    let mut split_at = url.len();
+    for marker in ['?', '#'] {
+        if let Some(idx) = url.find(marker) {
+            split_at = split_at.min(idx);
+        }
+    }
+    url.split_at(split_at)
+}
+
+fn url_path_looks_like_file(url: &str) -> bool {
+    let (prefix, _) = split_url_suffix(url);
+    let Some((_scheme, rest)) = prefix.split_once("://") else {
+        return false;
+    };
+    let path = match rest.split_once('/') {
+        Some((_authority, path)) => path,
+        None => return false,
+    };
+    let tail = path.rsplit('/').next().unwrap_or(path);
+    tail.contains('.') && !tail.ends_with('.')
 }
 
 fn indexed_manifest_from_bytes(
@@ -2496,6 +2680,124 @@ fn manifest_record_tsv_line(r: &ManifestRecord) -> String {
 mod tests {
     use super::*;
     use mx8_manifest_store::fs::FsManifestStore;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+
+    enum TestHttpRoute {
+        Manifest(Vec<u8>),
+        RangeObject {
+            content_type: &'static str,
+            body: Vec<u8>,
+        },
+        HtmlPage(Vec<u8>),
+    }
+
+    fn spawn_http_test_server(
+        routes: Vec<(&'static str, TestHttpRoute)>,
+    ) -> anyhow::Result<(String, mpsc::Sender<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let routes: Vec<(String, TestHttpRoute)> = routes
+            .into_iter()
+            .map(|(path, route)| (path.to_string(), route))
+            .collect();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        thread::spawn(move || loop {
+            if shutdown_rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _peer)) => {
+                    let _ = handle_http_test_connection(stream, &routes);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        });
+        Ok((format!("http://{addr}"), shutdown_tx))
+    }
+
+    fn handle_http_test_connection(
+        mut stream: TcpStream,
+        routes: &[(String, TestHttpRoute)],
+    ) -> anyhow::Result<()> {
+        let mut buf = [0u8; 4096];
+        let bytes_read = stream.read(&mut buf)?;
+        let request = String::from_utf8_lossy(&buf[..bytes_read]);
+        let mut lines = request.lines();
+        let request_line = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing request line"))?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing method"))?;
+        let raw_target = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing target"))?;
+        let path = raw_target.split('?').next().unwrap_or(raw_target);
+        let route = routes
+            .iter()
+            .find(|(candidate, _)| candidate == path)
+            .map(|(_, route)| route);
+
+        match route {
+            Some(TestHttpRoute::Manifest(bytes)) => {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/tab-separated-values\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                stream.write_all(response.as_bytes())?;
+                if method != "HEAD" {
+                    stream.write_all(bytes)?;
+                }
+            }
+            Some(TestHttpRoute::RangeObject { content_type, body }) => {
+                if request.contains("Range: bytes=0-0") {
+                    let first = *body.first().unwrap_or(&0);
+                    let response = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Type: {content_type}\r\nContent-Range: bytes 0-0/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        body.len().max(1)
+                    );
+                    stream.write_all(response.as_bytes())?;
+                    if method != "HEAD" {
+                        stream.write_all(&[first])?;
+                    }
+                } else {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes())?;
+                    if method != "HEAD" {
+                        stream.write_all(body)?;
+                    }
+                }
+            }
+            Some(TestHttpRoute::HtmlPage(bytes)) => {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                stream.write_all(response.as_bytes())?;
+                if method != "HEAD" {
+                    stream.write_all(bytes)?;
+                }
+            }
+            None => {
+                stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )?;
+            }
+        }
+        stream.flush()?;
+        Ok(())
+    }
 
     #[test]
     fn canonical_manifest_parser_accepts_empty_decode_hint_column() -> anyhow::Result<()> {
@@ -2718,12 +3020,90 @@ mod tests {
     }
 
     #[test]
-    fn source_registry_defaults_include_s3_and_file() {
+    fn source_registry_defaults_include_http_and_storage_schemes() {
         let registry = SourceResolverRegistry::with_defaults();
         let schemes = registry.schemes();
         assert!(schemes.iter().any(|s| s == "s3"));
         assert!(schemes.iter().any(|s| s == "file"));
+        assert!(schemes.iter().any(|s| s == "http"));
+        assert!(schemes.iter().any(|s| s == "https"));
         assert!(schemes.iter().any(|s| s == "hf"));
+    }
+
+    #[test]
+    fn http_source_resolver_indexes_serve_manifest_endpoint() -> anyhow::Result<()> {
+        let manifest_records = vec![
+            ManifestRecord {
+                sample_id: 0,
+                location: "http://edge.local/videos/a.mp4".to_string(),
+                byte_offset: None,
+                byte_length: None,
+                decode_hint: None,
+                segment_start_ms: None,
+                segment_end_ms: None,
+            },
+            ManifestRecord {
+                sample_id: 1,
+                location: "http://edge.local/videos/b.mp4".to_string(),
+                byte_offset: None,
+                byte_length: None,
+                decode_hint: None,
+                segment_start_ms: None,
+                segment_end_ms: None,
+            },
+        ];
+        let manifest_bytes = canonicalize_manifest_bytes(&manifest_records);
+        let (base_url, shutdown) = spawn_http_test_server(vec![(
+            "/archive/manifest",
+            TestHttpRoute::Manifest(manifest_bytes.clone()),
+        )])?;
+        let registry = SourceResolverRegistry::with_defaults();
+        let indexed =
+            registry.index_manifest_for_base(&format!("{base_url}/archive"), true, true, false)?;
+        let _ = shutdown.send(());
+        assert_eq!(indexed.canonical_bytes, manifest_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn http_source_resolver_indexes_direct_media_object() -> anyhow::Result<()> {
+        let (base_url, shutdown) = spawn_http_test_server(vec![(
+            "/clip.mp4",
+            TestHttpRoute::RangeObject {
+                content_type: "video/mp4",
+                body: vec![0, 1, 2, 3],
+            },
+        )])?;
+        let source_url = format!("{base_url}/clip.mp4?token=abc");
+        let registry = SourceResolverRegistry::with_defaults();
+        let indexed = registry.index_manifest_for_base(&source_url, true, true, false)?;
+        let _ = shutdown.send(());
+        let (records, _canonical) = parse_canonical_manifest_tsv_bytes(&indexed.canonical_bytes)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].location, source_url);
+        Ok(())
+    }
+
+    #[test]
+    fn http_source_resolver_rejects_html_pages() {
+        let (base_url, shutdown) = spawn_http_test_server(vec![(
+            "/page",
+            TestHttpRoute::HtmlPage(b"<html>nope</html>".to_vec()),
+        )])
+        .expect("spawn test http server");
+        let registry = SourceResolverRegistry::with_defaults();
+        let err = registry
+            .index_manifest_for_base(&format!("{base_url}/page"), true, true, false)
+            .unwrap_err();
+        let _ = shutdown.send(());
+        match err {
+            SnapshotError::IndexUnsupported(msg) => {
+                assert!(
+                    msg.contains("unsupported http content-type") || msg.contains("byte ranges")
+                );
+            }
+            other => panic!("expected IndexUnsupported, got {other:?}"),
+        }
     }
 
     #[test]

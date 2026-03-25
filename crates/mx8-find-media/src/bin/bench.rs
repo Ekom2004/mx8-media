@@ -43,9 +43,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         print_bench("libav-filtergraph-nonref-reopen-session", args.runs, || {
             bench_nonref_reopen_session(&request, args.session_chunks)
         })?;
-        print_bench("libav-filtergraph-nonref-persistent-session", args.runs, || {
-            bench_nonref_persistent_session(&request, args.session_chunks)
-        })?;
+        print_bench(
+            "libav-filtergraph-nonref-persistent-session",
+            args.runs,
+            || bench_nonref_persistent_session(&request, args.session_chunks),
+        )?;
     }
     Ok(())
 }
@@ -233,7 +235,11 @@ fn bench_nonref_persistent_session(
     };
     let (response, stats) = extract_windowed_rgb_frames_profiled(&windowed_request)?;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let total_frames = response.windows.iter().map(|window| window.frames.len()).sum();
+    let total_frames = response
+        .windows
+        .iter()
+        .map(|window| window.frames.len())
+        .sum();
     Ok(BenchResult {
         frames: total_frames,
         elapsed_ms,

@@ -777,7 +777,8 @@ impl CoordinatorSvc {
             .leases
             .values()
             .filter_map(|lease| {
-                lease.range
+                lease
+                    .range
                     .as_ref()
                     .map(|range| lease.cursor.saturating_sub(range.start_id))
             })
@@ -2401,11 +2402,7 @@ impl Coordinator for CoordinatorSvc {
                     completed_objects,
                 );
                 drop(state);
-                notifier.notify_progress(
-                    completed_objects,
-                    completed_bytes,
-                    current_workers,
-                );
+                notifier.notify_progress(completed_objects, completed_bytes, current_workers);
             }
             self.update_gauges().await;
             self.persist_state_store_snapshot().await?;
@@ -2464,11 +2461,7 @@ impl Coordinator for CoordinatorSvc {
                 completed_objects,
             );
             drop(state);
-            notifier.notify_progress(
-                completed_objects,
-                completed_bytes,
-                current_workers,
-            );
+            notifier.notify_progress(completed_objects, completed_bytes, current_workers);
         }
         self.persist_state_store_snapshot().await?;
         Ok(Response::new(ReportProgressResponse {}))

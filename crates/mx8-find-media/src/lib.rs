@@ -209,7 +209,10 @@ pub fn extract_sampled_rgb_frames(
 pub fn extract_sampled_rgb_frames_profiled(
     request: &ExtractFramesRequest,
 ) -> Result<(ExtractFramesResponse, ExtractFramesStats), ExtractFramesError> {
-    extract_sampled_rgb_frames_filter_graph_profiled_with_discard(request, DecodeDiscardMode::NonRef)
+    extract_sampled_rgb_frames_filter_graph_profiled_with_discard(
+        request,
+        DecodeDiscardMode::NonRef,
+    )
 }
 
 pub fn extract_sampled_rgb_frames_manual_profiled(
@@ -551,14 +554,24 @@ pub fn extract_windowed_rgb_frames_profiled_with_discard(
     request.validate()?;
     let super_request = ExtractFramesRequest {
         source_uri: request.source_uri.clone(),
-        scan_start_ms: request.windows.first().expect("validated windows").scan_start_ms,
-        scan_end_ms: request.windows.last().expect("validated windows").scan_end_ms,
+        scan_start_ms: request
+            .windows
+            .first()
+            .expect("validated windows")
+            .scan_start_ms,
+        scan_end_ms: request
+            .windows
+            .last()
+            .expect("validated windows")
+            .scan_end_ms,
         sample_fps: request.sample_fps,
         frame_width: request.frame_width,
         frame_height: request.frame_height,
     };
-    let (response, stats) =
-        extract_sampled_rgb_frames_filter_graph_profiled_with_discard(&super_request, discard_mode)?;
+    let (response, stats) = extract_sampled_rgb_frames_filter_graph_profiled_with_discard(
+        &super_request,
+        discard_mode,
+    )?;
     let mut buckets = request
         .windows
         .iter()
@@ -675,7 +688,8 @@ unsafe fn receive_available_filtered_frames(
 
         loop {
             let stage_started = Instant::now();
-            let sink_ret = ffi::av_buffersink_get_frame(filter_graph.buffersink_ctx, filtered_frame);
+            let sink_ret =
+                ffi::av_buffersink_get_frame(filter_graph.buffersink_ctx, filtered_frame);
             stats.filter_graph += stage_started.elapsed();
             if sink_ret == again_error_code() || sink_ret == AVERROR_EOF_CODE {
                 break;
