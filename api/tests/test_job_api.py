@@ -15,6 +15,7 @@ class SubmitJobRequestTests(unittest.TestCase):
             {
                 "input": "s3://raw-dashcam-archive/",
                 "output": "s3://training-dataset/",
+                "max": 3,
                 "work": [
                     {"type": "find", "params": {"query": "a stop sign"}},
                     {"type": "video.extract_frames", "params": {"fps": 1, "format": "jpeg"}},
@@ -28,6 +29,7 @@ class SubmitJobRequestTests(unittest.TestCase):
         self.assertEqual(internal.source, "s3://raw-dashcam-archive/")
         self.assertEqual(internal.sink, "s3://training-dataset/")
         self.assertEqual(internal.find, "a stop sign")
+        self.assertEqual(internal.max_outputs, 3)
         self.assertEqual(internal.transforms[0].type, "video.extract_frames")
         self.assertEqual(internal.transforms[0].params["format"], "jpg")
         self.assertEqual(internal.transforms[1].type, "image.resize")
@@ -62,6 +64,52 @@ class SubmitJobRequestTests(unittest.TestCase):
                 }
             )
 
+    def test_clip_alias_normalizes_to_video_transcode(self) -> None:
+        payload = SubmitJobRequest.model_validate(
+            {
+                "input": "s3://raw-dashcam-archive/",
+                "output": "s3://training-dataset/",
+                "work": [
+                    {"type": "find", "params": {"query": "a stop sign"}},
+                    {"type": "clip", "params": {}},
+                ],
+            }
+        )
+
+        internal = payload.to_internal()
+
+        self.assertEqual(internal.find, "a stop sign")
+        self.assertEqual(internal.transforms[0].type, "video.transcode")
+        self.assertEqual(internal.transforms[0].params["codec"], "h264")
+        self.assertEqual(internal.transforms[0].params["crf"], 23)
+
+    def test_find_only_job_is_allowed(self) -> None:
+        payload = SubmitJobRequest.model_validate(
+            {
+                "input": "s3://raw-dashcam-archive/",
+                "output": "s3://search-results/",
+                "work": [{"type": "find", "params": {"query": "a stop sign"}}],
+            }
+        )
+
+        internal = payload.to_internal()
+
+        self.assertEqual(internal.find, "a stop sign")
+        self.assertEqual(internal.transforms, [])
+
+    def test_max_must_be_positive(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max must be > 0"):
+            SubmitJobRequest.model_validate(
+                {
+                    "input": "s3://raw-dashcam-archive/",
+                    "output": "s3://training-dataset/",
+                    "max": 0,
+                    "work": [
+                        {"type": "video.extract_frames", "params": {"fps": 1, "format": "jpg"}}
+                    ],
+                }
+            )
+
     def test_mixed_canonical_and_legacy_fields_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "use either canonical input/work/output fields"):
             SubmitJobRequest.model_validate(
@@ -86,6 +134,7 @@ class JobViewTests(unittest.TestCase):
             transforms=[
                 TransformSpec(type="video.extract_frames", params={"fps": 1, "format": "jpg"})
             ],
+            max_outputs=5,
             matched_assets=3,
             matched_segments=5,
         )
@@ -94,6 +143,7 @@ class JobViewTests(unittest.TestCase):
 
         self.assertEqual(view.input, "s3://raw-dashcam-archive/")
         self.assertEqual(view.output, "s3://training-dataset/")
+        self.assertEqual(view.max, 5)
         self.assertEqual(view.work[0].type, "find")
         self.assertEqual(view.work[0].params["query"], "a stop sign")
         self.assertEqual(view.work[1].type, "video.extract_frames")

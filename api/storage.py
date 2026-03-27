@@ -41,6 +41,7 @@ class InMemoryJobStore:
             sink=request.sink,
             find=request.find,
             transforms=request.transforms,
+            max_outputs=request.max_outputs,
         )
         with self._lock:
             self._jobs[record.id] = record
@@ -118,6 +119,7 @@ class PostgresJobStore:
             sink=request.sink,
             find=request.find,
             transforms=request.transforms,
+            max_outputs=request.max_outputs,
         )
         transforms = [transform.model_dump(mode="json") for transform in record.transforms]
         with self._connect(self._dsn, autocommit=True) as conn:
@@ -131,6 +133,7 @@ class PostgresJobStore:
                         sink,
                         find_query,
                         transforms,
+                        max_outputs,
                         region,
                         instance_type,
                         manifest_hash,
@@ -145,9 +148,9 @@ class PostgresJobStore:
                         created_at,
                         updated_at
                     )
-                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     returning
-                        id, status, source, sink, find_query, transforms, region, instance_type,
+                        id, status, source, sink, find_query, transforms, max_outputs, region, instance_type,
                         manifest_hash,
                         matched_assets, matched_segments, total_objects, total_bytes,
                         completed_objects, completed_bytes, current_workers, desired_workers,
@@ -160,6 +163,7 @@ class PostgresJobStore:
                         record.sink,
                         record.find,
                         self._jsonb(transforms),
+                        record.max_outputs,
                         record.region,
                         record.instance_type,
                         record.manifest_hash,
@@ -184,7 +188,7 @@ class PostgresJobStore:
                 cur.execute(
                     """
                     select
-                        id, status, source, sink, find_query, transforms, region, instance_type,
+                        id, status, source, sink, find_query, transforms, max_outputs, region, instance_type,
                         manifest_hash,
                         matched_assets, matched_segments, total_objects, total_bytes,
                         completed_objects, completed_bytes, current_workers, desired_workers,
@@ -205,7 +209,7 @@ class PostgresJobStore:
                 cur.execute(
                     """
                     select
-                        id, status, source, sink, find_query, transforms, region, instance_type,
+                        id, status, source, sink, find_query, transforms, max_outputs, region, instance_type,
                         manifest_hash,
                         matched_assets, matched_segments, total_objects, total_bytes,
                         completed_objects, completed_bytes, current_workers, desired_workers,
@@ -226,7 +230,7 @@ class PostgresJobStore:
                     set status = %s, updated_at = %s
                     where id = %s
                     returning
-                        id, status, source, sink, find_query, transforms, region, instance_type,
+                        id, status, source, sink, find_query, transforms, max_outputs, region, instance_type,
                         manifest_hash,
                         matched_assets, matched_segments, total_objects, total_bytes,
                         completed_objects, completed_bytes, current_workers, desired_workers,
@@ -288,7 +292,7 @@ class PostgresJobStore:
                     set {", ".join(update_fields)}
                     where id = %s
                     returning
-                        id, status, source, sink, find_query, transforms, region, instance_type,
+                        id, status, source, sink, find_query, transforms, max_outputs, region, instance_type,
                         manifest_hash,
                         matched_assets, matched_segments, total_objects, total_bytes,
                         completed_objects, completed_bytes, current_workers, desired_workers,
@@ -321,6 +325,7 @@ class PostgresJobStore:
                         sink text not null,
                         find_query text,
                         transforms jsonb not null,
+                        max_outputs bigint,
                         region text,
                         instance_type text,
                         manifest_hash text,
@@ -340,6 +345,7 @@ class PostgresJobStore:
                 cur.execute("alter table jobs add column if not exists region text")
                 cur.execute("alter table jobs add column if not exists instance_type text")
                 cur.execute("alter table jobs add column if not exists find_query text")
+                cur.execute("alter table jobs add column if not exists max_outputs bigint")
                 cur.execute("alter table jobs add column if not exists manifest_hash text")
                 cur.execute("alter table jobs add column if not exists matched_assets bigint")
                 cur.execute("alter table jobs add column if not exists matched_segments bigint")
@@ -373,6 +379,7 @@ class PostgresJobStore:
             sink=str(data["sink"]),
             find=cast(str | None, data.get("find_query")),
             transforms=transforms,
+            max_outputs=cast(int | None, data.get("max_outputs")),
             region=cast(str | None, data.get("region")),
             instance_type=cast(str | None, data.get("instance_type")),
             manifest_hash=cast(str | None, data.get("manifest_hash")),

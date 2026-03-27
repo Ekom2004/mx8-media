@@ -118,6 +118,10 @@ struct Args {
     #[arg(long, env = "MX8_MANIFEST_HASH", default_value = "dev")]
     manifest_hash: String,
 
+    /// Stop after the first N manifest rows / outputs for preview-style runs.
+    #[arg(long, env = "MX8_MAX_OUTPUTS", default_value_t = 0)]
+    max_outputs: u64,
+
     /// Development-only: total number of samples to serve as contiguous WorkRanges.
     ///
     /// If this is 0, the coordinator will try to derive N from the pinned manifest bytes
@@ -448,6 +452,37 @@ fn manifest_stats_from_canonical_manifest_tsv(bytes: &[u8]) -> anyhow::Result<(u
         }
     }
     Ok((object_count, total_bytes))
+}
+
+fn truncate_canonical_manifest_tsv(bytes: &[u8], max_rows: usize) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(max_rows > 0, "max_rows must be > 0");
+    let s = std::str::from_utf8(bytes).map_err(|e| anyhow::anyhow!("manifest not utf-8: {e}"))?;
+    let mut out = String::new();
+    let mut lines = s.lines();
+    let header = lines
+        .by_ref()
+        .find(|l| !l.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("empty manifest"))?;
+    anyhow::ensure!(
+        header.trim_start().starts_with("schema_version="),
+        "manifest header missing schema_version"
+    );
+    out.push_str(header);
+    out.push('\n');
+
+    let mut kept = 0usize;
+    for raw in lines {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if kept >= max_rows {
+            break;
+        }
+        out.push_str(raw);
+        out.push('\n');
+        kept += 1;
+    }
+    Ok(out.into_bytes())
 }
 
 fn build_available_ranges_with_recovery(
@@ -2590,7 +2625,7 @@ async fn main() -> Result<()> {
         &manifest_store_root.to_string_lossy(),
     )?);
 
-    let resolved_manifest_hash = if let Some(link) = &args.dataset_link {
+    let mut resolved_manifest_hash = if let Some(link) = &args.dataset_link {
         let cfg = SnapshotResolverConfig {
             lock_stale_after: std::time::Duration::from_millis(args.snapshot_lock_stale_ms),
             wait_timeout: std::time::Duration::from_millis(args.snapshot_wait_timeout_ms),
@@ -2608,6 +2643,26 @@ async fn main() -> Result<()> {
     } else {
         args.manifest_hash.clone()
     };
+
+    if args.max_outputs > 0 && resolved_manifest_hash != "dev" {
+        let base_hash = ManifestHash(resolved_manifest_hash.clone());
+        let base_bytes = store.get_manifest_bytes(&base_hash)?;
+        let limited_bytes = truncate_canonical_manifest_tsv(
+            &base_bytes,
+            usize::try_from(args.max_outputs).unwrap_or(usize::MAX),
+        )?;
+        let limited_hash = ManifestHash(mx8_manifest_store::sha256_hex(&limited_bytes));
+        store.put_manifest_bytes(&limited_hash, &limited_bytes)?;
+        if limited_hash.0 != resolved_manifest_hash {
+            info!(
+                original_manifest_hash = %resolved_manifest_hash,
+                limited_manifest_hash = %limited_hash.0,
+                max_outputs = args.max_outputs,
+                "capped manifest to max_outputs"
+            );
+        }
+        resolved_manifest_hash = limited_hash.0;
+    }
 
     let span = info_span!(
         "mx8-coordinator",
@@ -2763,7 +2818,11 @@ async fn main() -> Result<()> {
         // ---------------------------------------------------------------------
 
         let total_samples = if args.dev_total_samples > 0 {
-            args.dev_total_samples
+            if args.max_outputs > 0 {
+                args.dev_total_samples.min(args.max_outputs)
+            } else {
+                args.dev_total_samples
+            }
         } else if resolved_manifest_hash != "dev" {
             match store.get_manifest_bytes(&ManifestHash(resolved_manifest_hash.clone())) {
                 Ok(bytes) => count_samples_in_canonical_manifest_tsv(&bytes)?,
@@ -3139,6 +3198,28 @@ mod tests {
         }
 
         assert_eq!(out, manifest);
+        Ok(())
+    }
+
+    #[test]
+    fn truncate_canonical_manifest_tsv_keeps_header_and_first_rows() -> anyhow::Result<()> {
+        let manifest = concat!(
+            "schema_version=0\n",
+            "0\ts3://bucket/a.mp4\t\t\tmx8:video;codec=h264\n",
+            "1\ts3://bucket/b.mp4\t\t\tmx8:video;codec=h264\n",
+            "2\ts3://bucket/c.mp4\t\t\tmx8:video;codec=h264\n",
+        );
+
+        let truncated = truncate_canonical_manifest_tsv(manifest.as_bytes(), 2)?;
+        let text = std::str::from_utf8(&truncated)?;
+        assert_eq!(
+            text,
+            concat!(
+                "schema_version=0\n",
+                "0\ts3://bucket/a.mp4\t\t\tmx8:video;codec=h264\n",
+                "1\ts3://bucket/b.mp4\t\t\tmx8:video;codec=h264\n",
+            )
+        );
         Ok(())
     }
 

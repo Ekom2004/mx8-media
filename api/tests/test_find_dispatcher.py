@@ -155,6 +155,51 @@ class DispatcherTests(unittest.TestCase):
         finally:
             dispatcher.stop()
 
+    def test_dispatcher_stops_early_when_max_outputs_is_satisfied(self) -> None:
+        dispatcher = FindDispatcher(
+            transport=MockFindTransport(),
+            access_resolver=PassthroughSourceAccessResolver(),
+        )
+        dispatcher.start()
+        try:
+            source_records = [
+                ManifestRecord(
+                    sample_id=index,
+                    location=f"s3://bucket/input-{index}.mp4",
+                    byte_offset=None,
+                    byte_length=None,
+                    decode_hint="mx8:video;codec=h264;duration_ms=1000",
+                )
+                for index in range(3)
+            ]
+            submitted = dispatcher.submit(
+                job_id="job-max",
+                customer_id="cust-1",
+                lane=FIND_INTERACTIVE_LANE,
+                priority=100,
+                query_text="input",
+                source_manifest_hash="basehash",
+                source_records=source_records,
+                video_records=source_records,
+                max_outputs=1,
+            )
+            self.assertTrue(submitted)
+
+            snapshot = None
+            for _ in range(50):
+                snapshot = dispatcher.pop_terminal_snapshot("job-max")
+                if snapshot is not None:
+                    break
+                time.sleep(0.01)
+
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            self.assertEqual(snapshot.status, "complete")
+            self.assertLess(snapshot.completed_shards, snapshot.total_shards)
+            self.assertGreaterEqual(len(snapshot.segments), 1)
+        finally:
+            dispatcher.stop()
+
     def test_build_find_shards_fans_out_long_unsegmented_video(self) -> None:
         shards = build_find_shards(
             job_id="job-1",

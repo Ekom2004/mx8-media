@@ -348,6 +348,8 @@ class CoordinatorLauncher:
                 "MX8_API_BASE_URL": api_base_url.rstrip("/"),
             }
         )
+        if record.max_outputs is not None:
+            env["MX8_MAX_OUTPUTS"] = str(record.max_outputs)
         return env
 
     def _max_workers(self) -> int:
@@ -501,6 +503,13 @@ def _rust_transform_json(transform: TransformSpec) -> dict[str, object]:
             "VideoTranscode": {
                 "codec": params["codec"],
                 "crf": params.get("crf", 23),
+            }
+        }
+    if transform.type == "audio.transcode":
+        return {
+            "AudioTranscode": {
+                "format": params["format"],
+                "bitrate": params.get("bitrate", "128k"),
             }
         }
     if transform.type == "video.resize":

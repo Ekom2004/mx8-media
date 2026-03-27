@@ -28,6 +28,7 @@ class MX8Client:
         input: str,
         work: Transform | FindWork | Sequence[Transform | FindWork] | TransformChain,
         output: str,
+        max: int | None = None,
     ) -> Job:
         normalized = _normalize_work(work)
         payload = {
@@ -35,6 +36,10 @@ class MX8Client:
             "output": output,
             "work": normalized["work"],
         }
+        if max is not None:
+            if max <= 0:
+                raise ValueError("max must be > 0")
+            payload["max"] = max
         body = self._request("POST", "/v1/jobs", payload)
         return _job_from_payload(self, body)
 
@@ -121,6 +126,7 @@ def _job_from_payload(client: MX8Client, payload: dict[str, Any]) -> Job:
         output=payload.get("output", payload["sink"]),
         work=work,
         find=find_query,
+        max=payload.get("max"),
         matched_assets=payload.get("matched_assets"),
         matched_segments=payload.get("matched_segments"),
     )

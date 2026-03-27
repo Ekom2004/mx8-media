@@ -223,6 +223,7 @@ class JobFinder:
                 source_manifest_hash=source_manifest_hash,
                 source_records=source_records,
                 video_records=video_records,
+                max_outputs=record.max_outputs,
             )
         except Exception:
             LOGGER.exception("finder failed to submit job %s", record.id)
@@ -248,6 +249,8 @@ class JobFinder:
                 )
                 return
             segments = normalize_segments(list(snapshot.segments), list(snapshot.source_records))
+            if record.max_outputs is not None:
+                segments = segments[: record.max_outputs]
             if not segments:
                 self._store.update_job_progress(
                     JobProgressUpdate(
@@ -281,7 +284,16 @@ class JobFinder:
                     desired_workers=0,
                 )
             )
-            if updated is not None and should_auto_queue_after_plan():
+            if updated is not None and not updated.transforms:
+                self._store.update_job_progress(
+                    JobProgressUpdate(
+                        job_id=record.id,
+                        status=JobStatus.COMPLETE,
+                        current_workers=0,
+                        desired_workers=0,
+                    )
+                )
+            elif updated is not None and should_auto_queue_after_plan():
                 pending = self._store.update_job_status(record.id, JobStatus.PENDING)
                 if pending is not None and self._wake_scaler is not None:
                     self._wake_scaler()

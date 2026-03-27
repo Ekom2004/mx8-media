@@ -46,6 +46,9 @@ class _PendingFindJob:
     source_manifest_hash: str
     source_records: tuple[ManifestRecord, ...]
     total_shards: int
+    pending_shards: deque[FindShard] | None = None
+    active_shards: int = 0
+    max_outputs: int | None = None
     completed_shards: int = 0
     segments: list[MatchSegment] | None = None
     status: str = "running"
@@ -139,6 +142,23 @@ class FindShardQueue:
         with self._cv:
             self._closed = True
             self._cv.notify_all()
+
+    def remove_job(self, job_id: str) -> int:
+        removed = 0
+        with self._cv:
+            for lane in FIND_LANES:
+                lane_customers = self._pending[lane]
+                for customer_id in list(lane_customers):
+                    customer_jobs = lane_customers.get(customer_id)
+                    if not customer_jobs or job_id not in customer_jobs:
+                        continue
+                    shards = customer_jobs.get(job_id)
+                    if shards is not None:
+                        removed += len(shards)
+                    self._remove_job_locked(lane, customer_id, job_id)
+            if removed:
+                self._cv.notify_all()
+        return removed
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -412,6 +432,7 @@ class FindDispatcher:
         source_manifest_hash: str,
         source_records: list[ManifestRecord],
         video_records: list[ManifestRecord],
+        max_outputs: int | None = None,
     ) -> bool:
         with self._lock:
             if job_id in self._jobs:
@@ -430,13 +451,16 @@ class FindDispatcher:
             source_manifest_hash=source_manifest_hash,
             source_records=tuple(source_records),
             total_shards=len(shards),
+            pending_shards=deque(shards),
+            max_outputs=max_outputs,
             segments=[],
         )
         with self._lock:
             if job_id in self._jobs:
                 return False
             self._jobs[job_id] = job
-        self._queue.enqueue(shards)
+            to_enqueue = self._drain_next_shards_locked(job)
+        self._queue.enqueue(to_enqueue)
         return True
 
     def pop_terminal_snapshot(self, job_id: str) -> FindJobSnapshot | None:
@@ -477,20 +501,35 @@ class FindDispatcher:
 
     def _record_result(self, result: FindShardResult) -> None:
         result.validate()
+        to_enqueue: list[FindShard] = []
+        prune_job_id: str | None = None
         with self._lock:
             job = self._jobs.get(result.job_id)
             if job is None or job.status in {"complete", "failed"}:
                 return
+            job.active_shards = max(0, job.active_shards - 1)
             job.completed_shards += 1
             if result.status == "error":
                 job.status = "failed"
                 job.error = result.error or "find shard failed"
-                return
-            if job.segments is None:
-                job.segments = []
-            job.segments.extend(result.hits)
-            if job.completed_shards >= job.total_shards:
-                job.status = "complete"
+                job.pending_shards = deque()
+                prune_job_id = result.job_id
+            else:
+                if job.segments is None:
+                    job.segments = []
+                job.segments.extend(result.hits)
+                if job.max_outputs is not None and len(job.segments) >= job.max_outputs:
+                    job.status = "complete"
+                    job.pending_shards = deque()
+                    prune_job_id = result.job_id
+                else:
+                    to_enqueue = self._drain_next_shards_locked(job)
+                    if not to_enqueue and job.active_shards == 0 and not job.pending_shards:
+                        job.status = "complete"
+        if prune_job_id is not None:
+            self._queue.remove_job(prune_job_id)
+        if to_enqueue:
+            self._queue.enqueue(to_enqueue)
 
     def _transport_instance(self) -> FindTransport:
         transport = self._transport
@@ -513,6 +552,23 @@ class FindDispatcher:
             base_active_shards_per_job=base_active_shards_per_job(),
             base_active_shards_per_customer=base_active_shards_per_customer(),
         )
+
+    @staticmethod
+    def _drain_next_shards_locked(job: _PendingFindJob) -> list[FindShard]:
+        if job.pending_shards is None or not job.pending_shards:
+            return []
+        max_active = base_active_shards_per_job()
+        available_slots = max(0, max_active - job.active_shards)
+        if job.max_outputs is not None:
+            remaining_outputs = max(0, job.max_outputs - len(job.segments or []))
+            available_slots = min(available_slots, max(1, remaining_outputs))
+        if available_slots <= 0:
+            return []
+        next_shards: list[FindShard] = []
+        while job.pending_shards and len(next_shards) < available_slots:
+            next_shards.append(job.pending_shards.popleft())
+        job.active_shards += len(next_shards)
+        return next_shards
 
 
 def build_find_transport() -> FindTransport:

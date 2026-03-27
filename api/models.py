@@ -29,6 +29,56 @@ class TransformSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_supported_transforms(self) -> "TransformSpec":
+        if self.type == "convert":
+            self.type = "image.convert"
+        elif self.type == "crop":
+            self.type = "image.crop"
+        elif self.type == "extract_audio":
+            self.type = "video.extract_audio"
+        elif self.type == "clip":
+            self.type = "video.transcode"
+            self.params.setdefault("codec", "h264")
+            self.params.setdefault("crf", 23)
+        elif self.type == "extract_frames":
+            self.type = "video.extract_frames"
+        elif self.type == "normalize":
+            self.type = "audio.normalize"
+        elif self.type == "resample":
+            self.type = "audio.resample"
+        elif self.type == "resize":
+            media = self.params.get("media")
+            if not isinstance(media, str) or not media.strip():
+                raise ValueError("resize requires media")
+            normalized_media = media.strip().lower()
+            if normalized_media == "video":
+                self.type = "video.resize"
+            elif normalized_media == "image":
+                self.type = "image.resize"
+            else:
+                raise ValueError("resize media must be one of: video, image")
+            self.params = {key: value for key, value in self.params.items() if key != "media"}
+        elif self.type == "filter":
+            media = self.params.get("media")
+            if not isinstance(media, str) or not media.strip():
+                raise ValueError("filter requires media")
+            normalized_media = media.strip().lower()
+            if normalized_media == "video":
+                self.type = "video.filter"
+            elif normalized_media == "image":
+                self.type = "image.filter"
+            elif normalized_media == "audio":
+                self.type = "audio.filter"
+            else:
+                raise ValueError("filter media must be one of: video, image, audio")
+            self.params = {key: value for key, value in self.params.items() if key != "media"}
+        elif self.type == "transcode":
+            if "codec" in self.params:
+                self.type = "video.transcode"
+            elif "format" in self.params:
+                self.type = "audio.transcode"
+            else:
+                raise ValueError("transcode requires codec for video or format for audio")
+
         if self.type == "image.resize":
             allowed = {"width", "height", "maintain_aspect"}
             width = self.params.get("width")
@@ -83,6 +133,21 @@ class TransformSpec(BaseModel):
                 raise ValueError("video.transcode only accepts codec and crf")
             self.params["codec"] = normalized_codec
             self.params["crf"] = crf
+        elif self.type == "audio.transcode":
+            allowed = {"format", "bitrate"}
+            format_value = self.params.get("format")
+            bitrate = self.params.get("bitrate", "128k")
+            if not isinstance(format_value, str):
+                raise ValueError("audio.transcode requires format")
+            normalized = format_value.strip().lower()
+            if normalized not in {"mp3", "wav", "flac"}:
+                raise ValueError("audio.transcode format must be one of mp3, wav, flac")
+            if not isinstance(bitrate, str) or not bitrate.strip():
+                raise ValueError("audio.transcode bitrate must be non-empty")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("audio.transcode only accepts format and bitrate")
+            self.params["format"] = normalized
+            self.params["bitrate"] = bitrate.strip()
         elif self.type == "video.resize":
             allowed = {"width", "height", "maintain_aspect"}
             width = self.params.get("width")
@@ -144,6 +209,30 @@ class TransformSpec(BaseModel):
             if not set(self.params).issubset(allowed):
                 raise ValueError("audio.normalize only accepts loudness")
             self.params["loudness"] = float(loudness)
+        elif self.type == "video.filter":
+            allowed = {"expr"}
+            expr = self.params.get("expr")
+            if not isinstance(expr, str) or not expr.strip():
+                raise ValueError("video.filter requires expr")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("video.filter only accepts expr")
+            self.params["expr"] = expr.strip()
+        elif self.type == "audio.filter":
+            allowed = {"expr"}
+            expr = self.params.get("expr")
+            if not isinstance(expr, str) or not expr.strip():
+                raise ValueError("audio.filter requires expr")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("audio.filter only accepts expr")
+            self.params["expr"] = expr.strip()
+        elif self.type == "image.filter":
+            allowed = {"expr"}
+            expr = self.params.get("expr")
+            if not isinstance(expr, str) or not expr.strip():
+                raise ValueError("image.filter requires expr")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("image.filter only accepts expr")
+            self.params["expr"] = expr.strip()
         return self
 
 
@@ -181,7 +270,8 @@ class CreateJobRequest(BaseModel):
     source: str
     sink: str
     find: Optional[str] = None
-    transforms: list[TransformSpec]
+    transforms: list[TransformSpec] = Field(default_factory=list)
+    max_outputs: Optional[int] = None
 
     @field_validator("find")
     @classmethod
@@ -193,28 +283,54 @@ class CreateJobRequest(BaseModel):
             raise ValueError("find must be non-empty")
         return normalized
 
+    @field_validator("max_outputs")
+    @classmethod
+    def validate_max_outputs(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError("max must be > 0")
+        return value
+
     @model_validator(mode="after")
     def validate_job(self) -> "CreateJobRequest":
         if not self.source.strip():
             raise ValueError("source must be non-empty")
         if not self.sink.strip():
             raise ValueError("sink must be non-empty")
-        if not self.transforms:
-            raise ValueError("transforms must be non-empty")
+        if not self.transforms and self.find is None:
+            raise ValueError("job must contain a find operation or at least one transform")
         if self.find is not None:
-            if self.transforms[0].type != "video.extract_frames":
-                raise ValueError("find currently requires video.extract_frames as the first transform")
-            if not all(transform.type.startswith("image.") for transform in self.transforms[1:]):
+            if self.transforms and not _is_find_compatible_transform_chain(self.transforms):
                 raise ValueError(
-                    "find currently supports only image transforms after video.extract_frames"
+                    "find requires a video-compatible transform chain: "
+                    "video transforms, video.extract_frames followed by image transforms, "
+                    "or video.extract_audio followed by audio transforms"
                 )
         return self
+
+
+def _is_find_compatible_transform_chain(transforms: list[TransformSpec]) -> bool:
+    if not transforms:
+        return False
+
+    transform_types = [transform.type for transform in transforms]
+    head = transform_types[0]
+    tail = transform_types[1:]
+    if head == "video.extract_frames":
+        return all(transform_type.startswith("image.") for transform_type in tail)
+    if head == "video.extract_audio":
+        return all(transform_type.startswith("audio.") for transform_type in tail)
+    if all(transform_type.startswith("video.") for transform_type in transform_types):
+        return True
+    return False
 
 
 class SubmitJobRequest(BaseModel):
     input: str
     output: str
     work: list[WorkSpec]
+    max: Optional[int] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -239,6 +355,7 @@ class SubmitJobRequest(BaseModel):
             "input": data.get("source"),
             "output": data.get("sink"),
             "work": work,
+            "max": data.get("max"),
         }
 
     @field_validator("input", "output")
@@ -248,6 +365,15 @@ class SubmitJobRequest(BaseModel):
         if not normalized:
             raise ValueError(f"{info.field_name} must be non-empty")
         return normalized
+
+    @field_validator("max")
+    @classmethod
+    def validate_max(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError("max must be > 0")
+        return value
 
     @model_validator(mode="after")
     def validate_job(self) -> "SubmitJobRequest":
@@ -270,14 +396,15 @@ class SubmitJobRequest(BaseModel):
                 continue
             transforms.append(TransformSpec(type=item.type, params=dict(item.params)))
 
-        if not transforms:
-            raise ValueError("work must contain at least one transform")
+        if not transforms and find_query is None:
+            raise ValueError("work must contain at least one operation")
 
         return CreateJobRequest(
             source=self.input,
             sink=self.output,
             find=find_query,
             transforms=transforms,
+            max_outputs=self.max,
         )
 
 
@@ -288,6 +415,7 @@ class JobRecord(BaseModel):
     sink: str
     find: Optional[str] = None
     transforms: list[TransformSpec]
+    max_outputs: Optional[int] = None
     region: Optional[str] = None
     instance_type: Optional[str] = None
     manifest_hash: Optional[str] = None
@@ -309,6 +437,7 @@ class JobView(BaseModel):
     input: str
     output: str
     work: list[WorkSpec]
+    max: Optional[int] = None
     region: Optional[str] = None
     instance_type: Optional[str] = None
     manifest_hash: Optional[str] = None
@@ -338,6 +467,7 @@ class JobView(BaseModel):
             input=record.source,
             output=record.sink,
             work=work,
+            max=record.max_outputs,
             region=record.region,
             instance_type=record.instance_type,
             manifest_hash=record.manifest_hash,

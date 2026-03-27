@@ -18,6 +18,7 @@ class Job:
     output: str
     work: Sequence[dict[str, Any]] = ()
     find: str | None = None
+    max: int | None = None
     matched_assets: int | None = None
     matched_segments: int | None = None
 
@@ -28,6 +29,7 @@ class Job:
         self.output = latest.output
         self.work = latest.work
         self.find = latest.find
+        self.max = latest.max
         self.matched_assets = latest.matched_assets
         self.matched_segments = latest.matched_segments
         return self
