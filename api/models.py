@@ -9,6 +9,19 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
+VIDEO_PRESETS = {
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+}
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -117,9 +130,10 @@ class TransformSpec(BaseModel):
             self.params["format"] = normalized
             self.params["quality"] = quality
         elif self.type == "video.transcode":
-            allowed = {"codec", "crf"}
+            allowed = {"codec", "crf", "preset"}
             codec = self.params.get("codec")
             crf = self.params.get("crf", 23)
+            preset = self.params.get("preset")
             if not isinstance(codec, str):
                 raise ValueError("video.transcode requires codec")
             normalized_codec = codec.strip().lower()
@@ -129,10 +143,23 @@ class TransformSpec(BaseModel):
                 raise ValueError("video.transcode codec must be one of h264, h265, av1")
             if not isinstance(crf, int) or not 0 <= crf <= 51:
                 raise ValueError("video.transcode crf must be in 0..=51")
+            normalized_preset = None
+            if preset is not None:
+                if not isinstance(preset, str) or not preset.strip():
+                    raise ValueError("video.transcode preset must be non-empty when set")
+                normalized_preset = preset.strip().lower()
+                if normalized_preset not in VIDEO_PRESETS:
+                    raise ValueError("video.transcode preset must be one of ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow")
+                if normalized_codec == "av1":
+                    raise ValueError("video.transcode preset is only supported for h264 and h265")
             if not set(self.params).issubset(allowed):
-                raise ValueError("video.transcode only accepts codec and crf")
+                raise ValueError("video.transcode only accepts codec, crf, and preset")
             self.params["codec"] = normalized_codec
             self.params["crf"] = crf
+            if normalized_preset is None:
+                self.params.pop("preset", None)
+            else:
+                self.params["preset"] = normalized_preset
         elif self.type == "audio.transcode":
             allowed = {"format", "bitrate"}
             format_value = self.params.get("format")

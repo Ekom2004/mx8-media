@@ -83,6 +83,44 @@ class SubmitJobRequestTests(unittest.TestCase):
         self.assertEqual(internal.transforms[0].params["codec"], "h264")
         self.assertEqual(internal.transforms[0].params["crf"], 23)
 
+    def test_video_transcode_accepts_preset(self) -> None:
+        payload = SubmitJobRequest.model_validate(
+            {
+                "input": "s3://raw-dashcam-archive/",
+                "output": "s3://training-dataset/",
+                "work": [
+                    {
+                        "type": "video.transcode",
+                        "params": {"codec": "H264", "crf": 23, "preset": "VeryFast"},
+                    }
+                ],
+            }
+        )
+
+        internal = payload.to_internal()
+
+        self.assertEqual(internal.transforms[0].type, "video.transcode")
+        self.assertEqual(internal.transforms[0].params["codec"], "h264")
+        self.assertEqual(internal.transforms[0].params["crf"], 23)
+        self.assertEqual(internal.transforms[0].params["preset"], "veryfast")
+
+    def test_video_transcode_rejects_preset_for_av1(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "video.transcode preset is only supported for h264 and h265"
+        ):
+            SubmitJobRequest.model_validate(
+                {
+                    "input": "s3://raw-dashcam-archive/",
+                    "output": "s3://training-dataset/",
+                    "work": [
+                        {
+                            "type": "video.transcode",
+                            "params": {"codec": "av1", "crf": 23, "preset": "veryfast"},
+                        }
+                    ],
+                }
+            )
+
     def test_find_only_job_is_allowed(self) -> None:
         payload = SubmitJobRequest.model_validate(
             {

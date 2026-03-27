@@ -81,12 +81,14 @@ message Transform {
     VideoFilter video_filter = 10;
     AudioFilter audio_filter = 11;
     ImageFilter image_filter = 12;
+    AudioTranscode audio_transcode = 13;
   }
 }
 
 message VideoTranscode {
   string codec = 1;
   uint32 crf = 2;
+  string preset = 3;
 }
 
 message VideoResize {
@@ -140,6 +142,11 @@ message AudioResample {
 
 message AudioNormalize {
   float loudness_lufs = 1;
+}
+
+message AudioTranscode {
+  string format = 1;
+  string bitrate = 2;
 }
 
 message NodeStats {

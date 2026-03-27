@@ -503,6 +503,7 @@ def _rust_transform_json(transform: TransformSpec) -> dict[str, object]:
             "VideoTranscode": {
                 "codec": params["codec"],
                 "crf": params.get("crf", 23),
+                "preset": params.get("preset", ""),
             }
         }
     if transform.type == "audio.transcode":

@@ -28,8 +28,11 @@ class TransformChain:
 
 
 class VideoTransformPipeline(TransformChain):
-    def transcode(self, *, codec: str, crf: int = 23) -> VideoTransformPipeline:
-        return self.append(video_module.transcode(codec=codec, crf=crf))
+    def clip(self, *, codec: str = "h264", crf: int = 23, preset: str | None = None) -> VideoTransformPipeline:
+        return self.append(video_module.clip(codec=codec, crf=crf, preset=preset))
+
+    def transcode(self, *, codec: str, crf: int = 23, preset: str | None = None) -> VideoTransformPipeline:
+        return self.append(video_module.transcode(codec=codec, crf=crf, preset=preset))
 
     def resize(self, *, width: int, height: int, maintain_aspect: bool = True) -> VideoTransformPipeline:
         return self.append(
@@ -55,6 +58,9 @@ class VideoTransformPipeline(TransformChain):
 
 
 class AudioTransformPipeline(TransformChain):
+    def transcode(self, *, format: str, bitrate: str = "128k") -> AudioTransformPipeline:
+        return self.append(audio_module.transcode(format=format, bitrate=bitrate))
+
     def resample(self, *, rate: int = 16000, channels: int = 1) -> AudioTransformPipeline:
         return self.append(audio_module.resample(rate=rate, channels=channels))
 
@@ -82,6 +88,9 @@ class ImageTransformPipeline(TransformChain):
 
 
 class _VideoTransformsFactory:
+    def clip(self, *, codec: str = "h264", crf: int = 23, preset: str | None = None) -> VideoTransformPipeline:
+        return VideoTransformPipeline().clip(codec=codec, crf=crf, preset=preset)
+
     def extract(self, *, mode: str = "frames", **params: object) -> VideoTransformPipeline:
         return VideoTransformPipeline().extract(mode=mode, **params)
 
@@ -97,11 +106,14 @@ class _VideoTransformsFactory:
     def resize(self, *, width: int, height: int, maintain_aspect: bool = True) -> VideoTransformPipeline:
         return VideoTransformPipeline().resize(width=width, height=height, maintain_aspect=maintain_aspect)
 
-    def transcode(self, *, codec: str, crf: int = 23) -> VideoTransformPipeline:
-        return VideoTransformPipeline().transcode(codec=codec, crf=crf)
+    def transcode(self, *, codec: str, crf: int = 23, preset: str | None = None) -> VideoTransformPipeline:
+        return VideoTransformPipeline().transcode(codec=codec, crf=crf, preset=preset)
 
 
 class _AudioTransformsFactory:
+    def transcode(self, *, format: str, bitrate: str = "128k") -> AudioTransformPipeline:
+        return AudioTransformPipeline().transcode(format=format, bitrate=bitrate)
+
     def resample(self, *, rate: int = 16000, channels: int = 1) -> AudioTransformPipeline:
         return AudioTransformPipeline().resample(rate=rate, channels=channels)
 

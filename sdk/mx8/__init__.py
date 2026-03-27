@@ -75,21 +75,22 @@ def extract_audio(*, format: str, bitrate: str = "128k") -> Transform:
     return _video_extract_audio(format=format, bitrate=bitrate)
 
 
-def clip(*, codec: str = "h264", crf: int = 23) -> Transform:
-    return _video_clip(codec=codec, crf=crf)
+def clip(*, codec: str = "h264", crf: int = 23, preset: str | None = None) -> Transform:
+    return _video_clip(codec=codec, crf=crf, preset=preset)
 
 
 def transcode(
     *,
     codec: str | None = None,
     crf: int = 23,
+    preset: str | None = None,
     format: str | None = None,
     bitrate: str = "128k",
 ) -> Transform:
     if codec is not None and format is not None:
-        raise ValueError("transcode accepts either video params (`codec`, `crf`) or audio params (`format`, `bitrate`), not both")
+        raise ValueError("transcode accepts either video params (`codec`, `crf`, `preset`) or audio params (`format`, `bitrate`), not both")
     if codec is not None:
-        return _video_transcode(codec=codec, crf=crf)
+        return _video_transcode(codec=codec, crf=crf, preset=preset)
     if format is not None:
         return _audio_transcode(format=format, bitrate=bitrate)
     raise ValueError("transcode requires either `codec` for video or `format` for audio")

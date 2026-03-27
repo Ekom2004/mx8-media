@@ -96,10 +96,11 @@ impl ToWire<wire::Transform> for core::TransformSpec {
         use wire::transform::Kind;
 
         let kind = match self {
-            core::TransformSpec::VideoTranscode { codec, crf } => {
+            core::TransformSpec::VideoTranscode { codec, crf, preset } => {
                 Kind::VideoTranscode(wire::VideoTranscode {
                     codec: codec.clone(),
                     crf: *crf,
+                    preset: preset.clone().unwrap_or_default(),
                 })
             }
             core::TransformSpec::VideoResize {
@@ -157,6 +158,12 @@ impl ToWire<wire::Transform> for core::TransformSpec {
                     channels: *channels,
                 })
             }
+            core::TransformSpec::AudioTranscode { format, bitrate } => {
+                Kind::AudioTranscode(wire::AudioTranscode {
+                    format: format.clone(),
+                    bitrate: bitrate.clone(),
+                })
+            }
             core::TransformSpec::AudioNormalize { loudness_lufs } => {
                 Kind::AudioNormalize(wire::AudioNormalize {
                     loudness_lufs: *loudness_lufs,
@@ -185,6 +192,11 @@ impl TryToCore<core::TransformSpec> for wire::Transform {
                 Ok(core::TransformSpec::VideoTranscode {
                     codec: spec.codec.clone(),
                     crf: spec.crf,
+                    preset: if spec.preset.trim().is_empty() {
+                        None
+                    } else {
+                        Some(spec.preset.clone())
+                    },
                 })
             }
             Kind::VideoResize(spec) => Ok(core::TransformSpec::VideoResize {
@@ -245,6 +257,14 @@ impl TryToCore<core::TransformSpec> for wire::Transform {
                 rate: spec.rate,
                 channels: spec.channels,
             }),
+            Kind::AudioTranscode(spec) => {
+                non_empty("format", &spec.format)?;
+                non_empty("bitrate", &spec.bitrate)?;
+                Ok(core::TransformSpec::AudioTranscode {
+                    format: spec.format.clone(),
+                    bitrate: spec.bitrate.clone(),
+                })
+            }
             Kind::AudioNormalize(spec) => Ok(core::TransformSpec::AudioNormalize {
                 loudness_lufs: spec.loudness_lufs,
             }),
@@ -386,6 +406,11 @@ mod tests {
             sink_uri: "s3://sink/output/".to_string(),
             aws_region: "us-east-1".to_string(),
             transforms: vec![
+                core::TransformSpec::VideoTranscode {
+                    codec: "h264".to_string(),
+                    crf: 23,
+                    preset: Some("veryfast".to_string()),
+                },
                 core::TransformSpec::ImageResize {
                     width: 512,
                     height: 512,

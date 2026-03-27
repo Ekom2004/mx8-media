@@ -114,6 +114,13 @@ struct AudioStreamMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct VideoStreamMetadata {
+    video_codec: String,
+    audio_codec: Option<String>,
+    format_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampleExecutionPlan {
     source_location: String,
     segment_start_ms: Option<u64>,
@@ -843,7 +850,8 @@ fn is_video_transform(transform: &TransformSpec) -> bool {
 fn is_audio_transform(transform: &TransformSpec) -> bool {
     matches!(
         transform,
-        TransformSpec::AudioResample { .. }
+        TransformSpec::AudioTranscode { .. }
+            | TransformSpec::AudioResample { .. }
             | TransformSpec::AudioNormalize { .. }
             | TransformSpec::AudioFilter { .. }
     )
@@ -915,8 +923,43 @@ fn transform_video_payload_for_sink(
         );
     }
 
+    let staged_input = SeekableInputFile::create(source_location, payload)?;
+    let stream_metadata = probe_video_stream_metadata(staged_input.path(), source_location).ok();
+    if video_stream_copy_safe(job_spec, sample_plan, stream_metadata.as_ref()) {
+        let mut command = Command::new("ffmpeg");
+        command
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-i")
+            .arg(staged_input.path());
+        append_segment_window_output_args(&mut command, sample_plan)?;
+        command
+            .arg("-c:v")
+            .arg("copy")
+            .arg("-c:a")
+            .arg("copy")
+            .arg("-movflags")
+            .arg("frag_keyframe+empty_moov")
+            .arg("-f")
+            .arg("mp4")
+            .arg("pipe:1");
+        return run_ffmpeg_stdout_from_seekable_input(
+            command,
+            &staged_input,
+            source_location,
+            "video stream copy",
+            transform_slots,
+        );
+    }
+
     let mut command = Command::new("ffmpeg");
-    command.arg("-hide_banner").arg("-loglevel").arg("error");
+    command
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(staged_input.path());
     append_segment_window_args(&mut command, sample_plan)?;
 
     if let Some(filter_chain) = video_filter_chain(&job_spec.transforms) {
@@ -930,7 +973,11 @@ fn transform_video_payload_for_sink(
         .arg("-c:v")
         .arg(codec_arg)
         .arg("-crf")
-        .arg(crf.to_string())
+        .arg(crf.to_string());
+    if let Some(preset) = video_output_preset(&job_spec.transforms) {
+        command.arg("-preset").arg(preset);
+    }
+    command
         .arg("-c:a")
         .arg("copy")
         .arg("-movflags")
@@ -939,13 +986,12 @@ fn transform_video_payload_for_sink(
         .arg("mp4")
         .arg("pipe:1");
 
-    run_ffmpeg_stdout(
+    run_ffmpeg_stdout_from_seekable_input(
         command,
-        payload,
+        &staged_input,
         source_location,
         "video transform",
         transform_slots,
-        FfmpegInputMode::SeekableFile,
     )
 }
 
@@ -955,7 +1001,7 @@ fn transform_audio_payload_for_sink(
     payload: &[u8],
     transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<u8>> {
-    let output_format = audio_output_format(source_location)?;
+    let output_format = audio_output_format(&job_spec.transforms, source_location)?;
     let input_metadata = probe_audio_stream_metadata(payload, source_location)?;
     let mut command = Command::new("ffmpeg");
     command
@@ -979,7 +1025,9 @@ fn transform_audio_payload_for_sink(
     let codec = ffmpeg_audio_codec(output_format)?;
     command.arg("-c:a").arg(codec);
     if output_format == "mp3" {
-        command.arg("-b:a").arg("192k");
+        command
+            .arg("-b:a")
+            .arg(audio_output_bitrate(&job_spec.transforms).unwrap_or("192k"));
     }
     command
         .arg("-f")
@@ -1185,6 +1233,66 @@ fn ffmpeg_time_arg(total_ms: u64) -> String {
     format!("{seconds}.{milliseconds:03}")
 }
 
+fn append_segment_window_output_args(
+    command: &mut Command,
+    sample_plan: &SampleExecutionPlan,
+) -> Result<()> {
+    match (sample_plan.segment_start_ms, sample_plan.segment_end_ms) {
+        (Some(start_ms), Some(end_ms)) => {
+            if end_ms <= start_ms {
+                anyhow::bail!(
+                    "segment_end_ms must be > segment_start_ms for {}",
+                    sample_plan.source_location
+                );
+            }
+            command.arg("-ss").arg(ffmpeg_time_arg(start_ms));
+            command.arg("-t").arg(ffmpeg_time_arg(end_ms - start_ms));
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => anyhow::bail!(
+            "segment_start_ms and segment_end_ms must both be set for {}",
+            sample_plan.source_location
+        ),
+    }
+}
+
+fn video_stream_copy_safe(
+    job_spec: &CoreJobSpec,
+    sample_plan: &SampleExecutionPlan,
+    metadata: Option<&VideoStreamMetadata>,
+) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    if job_spec.transforms.len() != 1 {
+        return false;
+    }
+    let Some(TransformSpec::VideoTranscode { codec, .. }) = job_spec.transforms.first() else {
+        return false;
+    };
+    let Some(target_codec) = normalize_video_codec(codec) else {
+        return false;
+    };
+    let Some(source_codec) = normalize_video_codec(&metadata.video_codec) else {
+        return false;
+    };
+    if source_codec != target_codec {
+        return false;
+    }
+    let format_name = metadata.format_name.as_str();
+    if !(format_name.contains("mp4") || format_name.contains("mov")) {
+        return false;
+    }
+    if !matches!(metadata.audio_codec.as_deref(), None | Some("aac")) {
+        return false;
+    }
+    if sample_plan.segment_start_ms.is_some() || sample_plan.segment_end_ms.is_some() {
+        return false;
+    }
+    true
+}
+
 fn video_filter_chain(transforms: &[TransformSpec]) -> Option<String> {
     let filters = transforms
         .iter()
@@ -1231,6 +1339,16 @@ fn video_output_crf(transforms: &[TransformSpec]) -> Option<u32> {
         })
 }
 
+fn video_output_preset(transforms: &[TransformSpec]) -> Option<&str> {
+    transforms
+        .iter()
+        .rev()
+        .find_map(|transform| match transform {
+            TransformSpec::VideoTranscode { preset, .. } => preset.as_deref(),
+            _ => None,
+        })
+}
+
 fn audio_filter_chain(transforms: &[TransformSpec]) -> Option<String> {
     let filters = transforms
         .iter()
@@ -1247,6 +1365,26 @@ fn audio_filter_chain(transforms: &[TransformSpec]) -> Option<String> {
     } else {
         Some(filters.join(","))
     }
+}
+
+fn audio_output_bitrate(transforms: &[TransformSpec]) -> Option<&str> {
+    transforms
+        .iter()
+        .rev()
+        .find_map(|transform| match transform {
+            TransformSpec::AudioTranscode { bitrate, .. } => Some(bitrate.as_str()),
+            _ => None,
+        })
+}
+
+fn audio_output_transcode_format(transforms: &[TransformSpec]) -> Option<&str> {
+    transforms
+        .iter()
+        .rev()
+        .find_map(|transform| match transform {
+            TransformSpec::AudioTranscode { format, .. } => Some(format.as_str()),
+            _ => None,
+        })
 }
 
 fn audio_output_rate(transforms: &[TransformSpec]) -> Option<u32> {
@@ -1334,7 +1472,14 @@ fn ffmpeg_audio_codec(format: &str) -> Result<&'static str> {
     }
 }
 
-fn audio_output_format(source_location: &str) -> Result<&'static str> {
+fn audio_output_format(
+    transforms: &[TransformSpec],
+    source_location: &str,
+) -> Result<&'static str> {
+    if let Some(format) = audio_output_transcode_format(transforms) {
+        return normalize_audio_format(format)
+            .ok_or_else(|| anyhow::anyhow!("unsupported audio output format: {format}"));
+    }
     let extension = source_extension(source_location)
         .ok_or_else(|| anyhow::anyhow!("audio source has no file extension: {source_location}"))?;
     normalize_audio_format(&extension).ok_or_else(|| {
@@ -1421,6 +1566,80 @@ fn probe_audio_stream_metadata(input: &[u8], source_location: &str) -> Result<Au
     })
 }
 
+fn probe_video_stream_metadata(path: &Path, source_location: &str) -> Result<VideoStreamMetadata> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("stream=codec_type,codec_name:format=format_name")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=0")
+        .arg(path)
+        .output()
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow::anyhow!(
+                    "ffprobe is required for video transforms but was not found in PATH"
+                )
+            }
+            _ => anyhow::anyhow!("ffprobe invocation failed for {source_location}: {err}"),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ffprobe video metadata failed for {source_location}: {}",
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|err| {
+        anyhow::anyhow!("ffprobe output was not valid utf8 for {source_location}: {err}")
+    })?;
+
+    let mut pending_codec_name: Option<String> = None;
+    let mut video_codec: Option<String> = None;
+    let mut audio_codec: Option<String> = None;
+    let mut format_name: Option<String> = None;
+
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(value) = line.strip_prefix("codec_name=") {
+            pending_codec_name = Some(value.trim().to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("codec_type=") {
+            match value.trim() {
+                "video" if video_codec.is_none() => {
+                    video_codec = pending_codec_name.take();
+                }
+                "audio" if audio_codec.is_none() => {
+                    audio_codec = pending_codec_name.take();
+                }
+                _ => {
+                    pending_codec_name = None;
+                }
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("format_name=") {
+            format_name = Some(value.trim().to_string());
+        }
+    }
+
+    let video_codec = video_codec
+        .ok_or_else(|| anyhow::anyhow!("ffprobe video codec missing for {source_location}"))?;
+
+    Ok(VideoStreamMetadata {
+        video_codec: video_codec.to_ascii_lowercase(),
+        audio_codec: audio_codec.map(|codec| codec.to_ascii_lowercase()),
+        format_name: format_name.unwrap_or_default().to_ascii_lowercase(),
+    })
+}
+
 fn audio_output_muxer(format: &str) -> &'static str {
     match normalize_audio_format(format) {
         Some("mp3") => "mp3",
@@ -1502,6 +1721,41 @@ fn preferred_seekable_input_dir() -> PathBuf {
     } else {
         std::env::temp_dir()
     }
+}
+
+fn run_ffmpeg_stdout_from_seekable_input(
+    mut command: Command,
+    staged_input: &SeekableInputFile,
+    source_location: &str,
+    op_name: &str,
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
+) -> Result<Vec<u8>> {
+    let _permit = transform_slots.map(|slots| slots.acquire()).transpose()?;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command.output().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            anyhow::anyhow!("ffmpeg is required for {op_name} but was not found in PATH")
+        }
+        _ => anyhow::anyhow!(
+            "ffmpeg invocation failed for {} ({}): {err}",
+            source_location,
+            staged_input.path().display()
+        ),
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ffmpeg {op_name} failed for {source_location}: {}",
+            stderr.trim()
+        );
+    }
+
+    Ok(output.stdout)
 }
 
 fn run_ffmpeg_stdout(
@@ -1762,6 +2016,10 @@ fn output_extension(transforms: &[TransformSpec], source_location: &str) -> Stri
         return format.to_string();
     }
 
+    if let Some(format) = audio_output_transcode_format(transforms) {
+        return format.to_string();
+    }
+
     if let Ok((_, format)) = video_extract_audio_stage(transforms) {
         return format.to_string();
     }
@@ -1776,6 +2034,7 @@ fn output_extension(transforms: &[TransformSpec], source_location: &str) -> Stri
         Some(TransformSpec::VideoTranscode { .. } | TransformSpec::VideoResize { .. }) => {
             "mp4".to_string()
         }
+        Some(TransformSpec::AudioTranscode { format, .. }) => format.clone(),
         _ => source_extension(source_location).unwrap_or_else(|| "bin".to_string()),
     }
 }
@@ -1813,6 +2072,7 @@ fn transform_tag(transforms: &[TransformSpec]) -> String {
             TransformSpec::ImageCrop { .. } => "crop",
             TransformSpec::ImageConvert { .. } => "convert",
             TransformSpec::ImageFilter { .. } => "filter",
+            TransformSpec::AudioTranscode { .. } => "transcode",
             TransformSpec::AudioResample { .. } => "resample",
             TransformSpec::AudioNormalize { .. } => "normalize",
             TransformSpec::AudioFilter { .. } => "filter",
@@ -2490,10 +2750,11 @@ async fn main() -> Result<()> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        normalized_image_extension, output_extension, render_outputs_for_sink,
-        render_outputs_for_sink_with_plan, run_lease, transform_payload_for_sink, AgentMetrics,
-        Args, CoreJobSpec, ManifestSource, SampleExecutionPlan, TransformProcessLimiter,
-        TransformSpec,
+        normalized_image_extension, output_extension, probe_video_stream_metadata,
+        render_outputs_for_sink, render_outputs_for_sink_with_plan, run_lease,
+        transform_payload_for_sink, video_stream_copy_safe, AgentMetrics, Args, CoreJobSpec,
+        ManifestSource, SampleExecutionPlan, TransformProcessLimiter, TransformSpec,
+        VideoStreamMetadata,
     };
     use image::{DynamicImage, GenericImageView, ImageFormat};
     use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
@@ -2719,6 +2980,16 @@ mod tests {
     }
 
     fn write_ffmpeg_test_video_with_audio(path: &Path, width: u32, height: u32) {
+        write_ffmpeg_test_video_with_audio_custom(path, width, height, 1, "1");
+    }
+
+    fn write_ffmpeg_test_video_with_audio_custom(
+        path: &Path,
+        width: u32,
+        height: u32,
+        duration_secs: u32,
+        rate: &str,
+    ) {
         let status = Command::new("ffmpeg")
             .arg("-y")
             .arg("-hide_banner")
@@ -2727,13 +2998,13 @@ mod tests {
             .arg("-f")
             .arg("lavfi")
             .arg("-i")
-            .arg(format!("testsrc=size={}x{}:rate=1", width, height))
+            .arg(format!("testsrc=size={}x{}:rate={rate}", width, height))
             .arg("-f")
             .arg("lavfi")
             .arg("-i")
             .arg("sine=frequency=1000:sample_rate=44100")
             .arg("-t")
-            .arg("1")
+            .arg(duration_secs.to_string())
             .arg("-pix_fmt")
             .arg("yuv420p")
             .arg("-c:v")
@@ -2845,6 +3116,99 @@ mod tests {
             .find(|line| !line.is_empty())
             .expect("audio codec")
             .to_string()
+    }
+
+    #[test]
+    fn video_stream_copy_safe_only_for_single_same_codec_mp4_case() {
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::VideoTranscode {
+                codec: "h264".to_string(),
+                crf: 23,
+                preset: None,
+            }],
+        };
+        let sample_plan = SampleExecutionPlan::full("s3://in/sample.mp4");
+        let metadata = VideoStreamMetadata {
+            video_codec: "h264".to_string(),
+            audio_codec: Some("aac".to_string()),
+            format_name: "mov,mp4,m4a,3gp,3g2,mj2".to_string(),
+        };
+        assert!(video_stream_copy_safe(&spec, &sample_plan, Some(&metadata)));
+
+        let mismatch = VideoStreamMetadata {
+            video_codec: "hevc".to_string(),
+            ..metadata.clone()
+        };
+        assert!(!video_stream_copy_safe(
+            &spec,
+            &sample_plan,
+            Some(&mismatch)
+        ));
+
+        let unsupported_audio = VideoStreamMetadata {
+            audio_codec: Some("opus".to_string()),
+            ..metadata.clone()
+        };
+        assert!(!video_stream_copy_safe(
+            &spec,
+            &sample_plan,
+            Some(&unsupported_audio)
+        ));
+
+        let segmented_plan = SampleExecutionPlan {
+            source_location: sample_plan.source_location.clone(),
+            segment_start_ms: Some(1_000),
+            segment_end_ms: Some(2_000),
+        };
+        assert!(!video_stream_copy_safe(
+            &spec,
+            &segmented_plan,
+            Some(&metadata)
+        ));
+
+        let resize_spec = CoreJobSpec {
+            transforms: vec![
+                TransformSpec::VideoResize {
+                    width: 32,
+                    height: 32,
+                    maintain_aspect: true,
+                },
+                TransformSpec::VideoTranscode {
+                    codec: "h264".to_string(),
+                    crf: 23,
+                    preset: None,
+                },
+            ],
+            ..spec.clone()
+        };
+        assert!(!video_stream_copy_safe(
+            &resize_spec,
+            &sample_plan,
+            Some(&metadata)
+        ));
+    }
+
+    #[test]
+    fn probe_video_stream_metadata_reads_fixture_codecs() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("video-stream-metadata");
+        let input_path = root.join("input.mp4");
+        write_ffmpeg_test_video_with_audio(&input_path, 64, 64);
+
+        let metadata =
+            probe_video_stream_metadata(&input_path, "file:///input.mp4").expect("probe video");
+        assert_eq!(metadata.video_codec, "h264");
+        assert_eq!(metadata.audio_codec.as_deref(), Some("aac"));
+        assert!(metadata.format_name.contains("mp4") || metadata.format_name.contains("mov"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn ffprobe_audio_details(path: &Path) -> (String, u32, u32) {
@@ -3131,6 +3495,7 @@ mod tests {
                 TransformSpec::VideoTranscode {
                     codec: "h265".to_string(),
                     crf: 28,
+                    preset: None,
                 },
             ],
         };
@@ -3142,6 +3507,44 @@ mod tests {
         let (width, height, codec) = ffprobe_video_stream(&output_path);
         assert_eq!((width, height), (64, 64));
         assert_eq!(codec, "hevc");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_transcode_same_codec_full_file_keeps_valid_output() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("video-transcode-stream-copy");
+        let input_path = root.join("input.mp4");
+        let output_path = root.join("output.mp4");
+        write_ffmpeg_test_video_with_audio(&input_path, 128, 72);
+        let payload = std::fs::read(&input_path).expect("read input video");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::VideoTranscode {
+                codec: "h264".to_string(),
+                crf: 23,
+                preset: None,
+            }],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.mp4", payload.as_slice())
+                .expect("transform");
+        std::fs::write(&output_path, transformed).expect("write output video");
+        let (width, height, codec) = ffprobe_video_stream(&output_path);
+        assert_eq!((width, height), (128, 72));
+        assert_eq!(codec, "h264");
+        let audio_codec = ffprobe_audio_stream(&output_path);
+        assert_eq!(audio_codec, "aac");
+        let duration_secs = ffprobe_media_duration_secs(&output_path);
+        assert!(duration_secs >= 0.9 && duration_secs <= 1.1);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3165,6 +3568,7 @@ mod tests {
             transforms: vec![TransformSpec::VideoTranscode {
                 codec: "h264".to_string(),
                 crf: 23,
+                preset: None,
             }],
         };
         let sample_plan = SampleExecutionPlan {
@@ -3559,8 +3963,9 @@ mod tests {
                 sink_uri: format!("file://{}", output_root.display()),
                 aws_region: "us-east-1".to_string(),
                 transforms: vec![TransformSpec::VideoTranscode {
-                    codec: "h264".to_string(),
+                    codec: "h265".to_string(),
                     crf: 23,
+                    preset: None,
                 }],
             };
 
@@ -3608,6 +4013,144 @@ mod tests {
 
     #[test]
     #[ignore = "benchmark"]
+    fn profile_video_transcode_preset_throughput() {
+        if !video_tools_available() {
+            return;
+        }
+
+        for (label, preset) in [("default", None), ("veryfast", Some("veryfast"))] {
+            for duration_secs in [60_u32, 120_u32] {
+                let root =
+                    temp_test_dir(&format!("video-transcode-preset-{label}-{duration_secs}"));
+                let input_path = root.join("input.mp4");
+                let output_root = root.join("out");
+                write_ffmpeg_test_video_custom(&input_path, 1280, 720, duration_secs, "30");
+                let payload = std::fs::read(&input_path).expect("read input video");
+                let spec = CoreJobSpec {
+                    job_id: "job".to_string(),
+                    source_uri: "file:///input".to_string(),
+                    sink_uri: format!("file://{}", output_root.display()),
+                    aws_region: "us-east-1".to_string(),
+                    transforms: vec![TransformSpec::VideoTranscode {
+                        codec: "h265".to_string(),
+                        crf: 23,
+                        preset: preset.map(str::to_string),
+                    }],
+                };
+
+                let render_started = Instant::now();
+                let artifacts = render_outputs_for_sink(
+                    &spec,
+                    "file:///input/sample.mp4",
+                    1,
+                    payload.as_slice(),
+                    None,
+                )
+                .expect("render outputs");
+                let render_elapsed = render_started.elapsed();
+
+                let artifact_count = artifacts.len();
+                let output_bytes: usize = artifacts
+                    .iter()
+                    .map(|artifact| artifact.payload.len())
+                    .sum();
+
+                let write_started = Instant::now();
+                for artifact in &artifacts {
+                    let path = super::parse_file_uri(&artifact.output_uri).expect("parse file uri");
+                    super::write_file_output(&path, &artifact.payload).expect("write file output");
+                }
+                let write_elapsed = write_started.elapsed();
+
+                let total_elapsed = render_elapsed + write_elapsed;
+                let realtime_multiple = duration_secs as f64 / total_elapsed.as_secs_f64();
+
+                println!(
+                    "video_transcode_preset preset={} duration={}s outputs={} output_bytes={} render_ms={} write_ms={} total_ms={} realtime_x={:.2}",
+                    label,
+                    duration_secs,
+                    artifact_count,
+                    output_bytes,
+                    render_elapsed.as_millis(),
+                    write_elapsed.as_millis(),
+                    total_elapsed.as_millis(),
+                    realtime_multiple,
+                );
+
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn profile_video_stream_copy_transform_throughput() {
+        if !video_tools_available() {
+            return;
+        }
+
+        for duration_secs in [60_u32, 120_u32] {
+            let root = temp_test_dir(&format!("video-stream-copy-bench-{duration_secs}"));
+            let input_path = root.join("input.mp4");
+            let output_root = root.join("out");
+            write_ffmpeg_test_video_with_audio_custom(&input_path, 1280, 720, duration_secs, "30");
+            let payload = std::fs::read(&input_path).expect("read input video");
+            let spec = CoreJobSpec {
+                job_id: "job".to_string(),
+                source_uri: "file:///input".to_string(),
+                sink_uri: format!("file://{}", output_root.display()),
+                aws_region: "us-east-1".to_string(),
+                transforms: vec![TransformSpec::VideoTranscode {
+                    codec: "h264".to_string(),
+                    crf: 23,
+                    preset: None,
+                }],
+            };
+
+            let render_started = Instant::now();
+            let artifacts = render_outputs_for_sink(
+                &spec,
+                "file:///input/sample.mp4",
+                1,
+                payload.as_slice(),
+                None,
+            )
+            .expect("render outputs");
+            let render_elapsed = render_started.elapsed();
+
+            let artifact_count = artifacts.len();
+            let output_bytes: usize = artifacts
+                .iter()
+                .map(|artifact| artifact.payload.len())
+                .sum();
+
+            let write_started = Instant::now();
+            for artifact in &artifacts {
+                let path = super::parse_file_uri(&artifact.output_uri).expect("parse file uri");
+                super::write_file_output(&path, &artifact.payload).expect("write file output");
+            }
+            let write_elapsed = write_started.elapsed();
+
+            let total_elapsed = render_elapsed + write_elapsed;
+            let realtime_multiple = duration_secs as f64 / total_elapsed.as_secs_f64();
+
+            println!(
+                "video_stream_copy_transform duration={}s outputs={} output_bytes={} render_ms={} write_ms={} total_ms={} realtime_x={:.2}",
+                duration_secs,
+                artifact_count,
+                output_bytes,
+                render_elapsed.as_millis(),
+                write_elapsed.as_millis(),
+                total_elapsed.as_millis(),
+                realtime_multiple,
+            );
+
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
     fn profile_video_segment_export_transform_throughput() {
         if !video_tools_available() {
             return;
@@ -3627,6 +4170,7 @@ mod tests {
             transforms: vec![TransformSpec::VideoTranscode {
                 codec: "h264".to_string(),
                 crf: 23,
+                preset: None,
             }],
         };
 
@@ -3786,6 +4330,40 @@ mod tests {
     }
 
     #[test]
+    fn audio_transcode_rewrites_format() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("audio-transcode");
+        let input_path = root.join("input.wav");
+        let output_path = root.join("output.mp3");
+        write_ffmpeg_test_audio(&input_path, 44_100, 2);
+        let payload = std::fs::read(&input_path).expect("read input audio");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::AudioTranscode {
+                format: "mp3".to_string(),
+                bitrate: "160k".to_string(),
+            }],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.wav", payload.as_slice())
+                .expect("transform");
+        std::fs::write(&output_path, transformed).expect("write output audio");
+        let (codec, sample_rate, channels) = ffprobe_audio_details(&output_path);
+        assert_eq!(codec, "mp3");
+        assert_eq!(sample_rate, 44_100);
+        assert_eq!(channels, 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn audio_normalize_preserves_audio_container() {
         if !video_tools_available() {
             return;
@@ -3856,6 +4434,23 @@ mod tests {
         assert_eq!(channels, 1);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audio_transcode_then_normalize_keeps_transcoded_extension() {
+        let extension = output_extension(
+            &[
+                TransformSpec::AudioTranscode {
+                    format: "flac".to_string(),
+                    bitrate: "128k".to_string(),
+                },
+                TransformSpec::AudioNormalize {
+                    loudness_lufs: -16.0,
+                },
+            ],
+            "s3://in/sample.wav",
+        );
+        assert_eq!(extension, "flac");
     }
 
     #[test]

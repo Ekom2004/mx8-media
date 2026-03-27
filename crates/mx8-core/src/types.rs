@@ -53,6 +53,7 @@ pub enum TransformSpec {
     VideoTranscode {
         codec: String,
         crf: u32,
+        preset: Option<String>,
     },
     VideoResize {
         width: u32,
@@ -90,6 +91,10 @@ pub enum TransformSpec {
         rate: u32,
         channels: u32,
     },
+    AudioTranscode {
+        format: String,
+        bitrate: String,
+    },
     AudioNormalize {
         loudness_lufs: f32,
     },
@@ -101,7 +106,7 @@ pub enum TransformSpec {
 impl TransformSpec {
     pub fn validate(&self) -> Result<(), TransformSpecError> {
         match self {
-            Self::VideoTranscode { codec, crf } => {
+            Self::VideoTranscode { codec, crf, preset } => {
                 if normalize_video_codec(codec).is_none() {
                     return Err(TransformSpecError::UnsupportedVideoCodec(
                         codec.trim().to_string(),
@@ -109,6 +114,17 @@ impl TransformSpec {
                 }
                 if *crf > 51 {
                     return Err(TransformSpecError::CrfOutOfRange(*crf));
+                }
+                if let Some(preset) = preset {
+                    let normalized_preset = normalize_video_preset(preset).ok_or_else(|| {
+                        TransformSpecError::UnsupportedVideoPreset(preset.trim().to_string())
+                    })?;
+                    if normalize_video_codec(codec) == Some("av1") {
+                        return Err(TransformSpecError::VideoPresetUnsupportedForCodec {
+                            codec: "av1".to_string(),
+                            preset: normalized_preset.to_string(),
+                        });
+                    }
                 }
             }
             Self::VideoResize { width, height, .. }
@@ -127,7 +143,8 @@ impl TransformSpec {
                     ));
                 }
             }
-            Self::VideoExtractAudio { format, bitrate } => {
+            Self::VideoExtractAudio { format, bitrate }
+            | Self::AudioTranscode { format, bitrate } => {
                 if normalize_audio_format(format).is_none() {
                     return Err(TransformSpecError::UnsupportedAudioFormat(
                         format.trim().to_string(),
@@ -189,6 +206,21 @@ pub fn normalize_video_codec(codec: &str) -> Option<&'static str> {
         "h264" => Some("h264"),
         "h265" | "hevc" => Some("h265"),
         "av1" => Some("av1"),
+        _ => None,
+    }
+}
+
+pub fn normalize_video_preset(preset: &str) -> Option<&'static str> {
+    match preset.trim().to_ascii_lowercase().as_str() {
+        "ultrafast" => Some("ultrafast"),
+        "superfast" => Some("superfast"),
+        "veryfast" => Some("veryfast"),
+        "faster" => Some("faster"),
+        "fast" => Some("fast"),
+        "medium" => Some("medium"),
+        "slow" => Some("slow"),
+        "slower" => Some("slower"),
+        "veryslow" => Some("veryslow"),
         _ => None,
     }
 }
@@ -349,6 +381,10 @@ pub enum TransformSpecError {
     CrfOutOfRange(u32),
     #[error("video codec must be one of h264, h265, av1 (got {0})")]
     UnsupportedVideoCodec(String),
+    #[error("video preset must be one of ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow (got {0})")]
+    UnsupportedVideoPreset(String),
+    #[error("video preset {preset} is not supported for codec {codec}")]
+    VideoPresetUnsupportedForCodec { codec: String, preset: String },
     #[error("audio format must be one of mp3, wav, flac (got {0})")]
     UnsupportedAudioFormat(String),
     #[error("frame format must be one of jpg, png (got {0})")]
@@ -467,6 +503,7 @@ mod tests {
         let err = TransformSpec::VideoTranscode {
             codec: "vp9".to_string(),
             crf: 23,
+            preset: None,
         }
         .validate()
         .expect_err("expected unsupported codec");
@@ -477,8 +514,55 @@ mod tests {
     }
 
     #[test]
+    fn video_transcode_validate_rejects_unsupported_preset() {
+        let err = TransformSpec::VideoTranscode {
+            codec: "h264".to_string(),
+            crf: 23,
+            preset: Some("turbo".to_string()),
+        }
+        .validate()
+        .expect_err("expected unsupported preset");
+        assert_eq!(
+            err,
+            TransformSpecError::UnsupportedVideoPreset("turbo".to_string())
+        );
+    }
+
+    #[test]
+    fn video_transcode_validate_rejects_preset_for_av1() {
+        let err = TransformSpec::VideoTranscode {
+            codec: "av1".to_string(),
+            crf: 23,
+            preset: Some("veryfast".to_string()),
+        }
+        .validate()
+        .expect_err("expected av1 preset rejection");
+        assert_eq!(
+            err,
+            TransformSpecError::VideoPresetUnsupportedForCodec {
+                codec: "av1".to_string(),
+                preset: "veryfast".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn video_extract_audio_validate_rejects_unsupported_format() {
         let err = TransformSpec::VideoExtractAudio {
+            format: "aac".to_string(),
+            bitrate: "128k".to_string(),
+        }
+        .validate()
+        .expect_err("expected unsupported audio format");
+        assert_eq!(
+            err,
+            TransformSpecError::UnsupportedAudioFormat("aac".to_string())
+        );
+    }
+
+    #[test]
+    fn audio_transcode_validate_rejects_unsupported_format() {
+        let err = TransformSpec::AudioTranscode {
             format: "aac".to_string(),
             bitrate: "128k".to_string(),
         }
