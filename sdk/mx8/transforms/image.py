@@ -70,3 +70,17 @@ def filter(*, expr: str) -> Transform:
         kind="image.filter",
         params={"expr": _require_non_empty("expr", expr)},
     )
+
+
+def remove_background() -> Transform:
+    return Transform(
+        kind="image.remove_background",
+        params={},
+    )
+
+
+def develop_raw() -> Transform:
+    return Transform(
+        kind="image.develop_raw",
+        params={},
+    )

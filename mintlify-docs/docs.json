@@ -1,0 +1,36 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "MX8 Docs",
+  "description": "Transform massive media datasets without building the systems around them.",
+  "colors": {
+    "primary": "#f4f4f5",
+    "light": "#fafafa",
+    "dark": "#09090b"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Getting Started",
+        "pages": [
+          "index",
+          "quickstart"
+        ]
+      },
+      {
+        "group": "Core Workflows",
+        "pages": [
+          "transforms",
+          "api"
+        ]
+      },
+      {
+        "group": "Operations",
+        "pages": [
+          "support",
+          "onboarding"
+        ]
+      }
+    ]
+  }
+}

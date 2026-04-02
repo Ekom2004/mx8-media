@@ -4,6 +4,7 @@ from ._base import Transform
 
 
 SUPPORTED_CODECS = frozenset({"h264", "h265", "av1"})
+SUPPORTED_CONTAINERS = frozenset({"mp4"})
 SUPPORTED_PRESETS = frozenset(
     {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
 )
@@ -23,6 +24,13 @@ def _normalize_codec(codec: str) -> str:
         normalized = "h265"
     if normalized not in SUPPORTED_CODECS:
         raise ValueError("codec must be one of: h264, h265, av1")
+    return normalized
+
+
+def _normalize_container(container: str) -> str:
+    normalized = container.strip().lower()
+    if normalized not in SUPPORTED_CONTAINERS:
+        raise ValueError("container must be one of: mp4")
     return normalized
 
 
@@ -98,6 +106,25 @@ def clip(*, codec: str = "h264", crf: int = 23, preset: str | None = None) -> Tr
     if normalized_preset is not None:
         params["preset"] = normalized_preset
     return Transform(kind="clip", params=params)
+
+
+def proxy(*, codec: str = "h264", crf: int = 28, preset: str | None = "veryfast") -> Transform:
+    normalized_codec = _normalize_codec(codec)
+    params = {
+        "codec": normalized_codec,
+        "crf": _require_crf(crf),
+    }
+    normalized_preset = _normalize_preset(preset, codec=normalized_codec)
+    if normalized_preset is not None:
+        params["preset"] = normalized_preset
+    return Transform(kind="proxy", params=params)
+
+
+def remux(*, container: str = "mp4") -> Transform:
+    return Transform(
+        kind="video.remux",
+        params={"container": _normalize_container(container)},
+    )
 
 
 def resize(*, width: int, height: int, maintain_aspect: bool = True) -> Transform:

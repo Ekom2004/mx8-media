@@ -1,0 +1,51 @@
+---
+title: "Onboarding"
+description: "How to onboard design partners and support their jobs."
+---
+
+# Onboarding
+
+## What a design partner needs
+
+- base API URL
+- MX8 SDK
+- one known-good transform example
+- the current support line
+- a support contact path for failed jobs
+
+## First workloads
+
+Start with straightforward transform jobs:
+
+- image: `crop -> resize -> convert`
+- video: `proxy()`
+- audio: `extract_audio -> resample -> normalize`
+
+## Support loop
+
+When a partner sends a failed `job_id`, the operator should look at:
+
+- `status`
+- `stage`
+- `failure_category`
+- `failure_message`
+- `outputs_written`
+- `worker_pool`
+- recent `events`
+
+That should be enough to answer:
+
+- did it fail in planning or execution?
+- were workers assigned?
+- were any outputs written?
+- is the issue on the customer side or MX8 side?
+
+## Remote validation
+
+Before expanding a partner onto larger workloads, validate real remote `s3 -> s3` runs for:
+
+- image transforms
+- video transforms
+- `proxy()`
+- `remux()`
+- audio transforms

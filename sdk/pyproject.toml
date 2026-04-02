@@ -13,6 +13,9 @@ requires-python = ">=3.10"
 Homepage = "https://github.com/Ekom2004/mx8-media"
 Repository = "https://github.com/Ekom2004/mx8-media"
 
+[project.scripts]
+mx8 = "mx8.cli:main"
+
 [tool.setuptools]
 package-dir = {"" = "."}
 

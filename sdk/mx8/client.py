@@ -122,6 +122,7 @@ def _job_from_payload(client: MX8Client, payload: dict[str, Any]) -> Job:
         client=client,
         id=payload["id"],
         status=payload["status"],
+        stage=payload.get("stage"),
         input=payload.get("input", payload["source"]),
         output=payload.get("output", payload["sink"]),
         work=work,
@@ -129,4 +130,9 @@ def _job_from_payload(client: MX8Client, payload: dict[str, Any]) -> Job:
         max=payload.get("max"),
         matched_assets=payload.get("matched_assets"),
         matched_segments=payload.get("matched_segments"),
+        outputs_written=payload.get("outputs_written"),
+        worker_pool=payload.get("worker_pool"),
+        failure_category=payload.get("failure_category"),
+        failure_message=payload.get("failure_message"),
+        events=tuple(payload.get("events") or ()),
     )

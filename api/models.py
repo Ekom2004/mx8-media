@@ -36,6 +36,57 @@ class JobStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class JobStage(str, Enum):
+    SUBMITTED = "SUBMITTED"
+    PLANNING = "PLANNING"
+    PLANNED = "PLANNED"
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETE = "COMPLETE"
+    FAILED = "FAILED"
+
+
+class JobFailureCategory(str, Enum):
+    INPUT_ERROR = "input_error"
+    AUTH_ERROR = "auth_error"
+    PLANNING_ERROR = "planning_error"
+    CAPACITY_ERROR = "capacity_error"
+    WORKER_ERROR = "worker_error"
+    SINK_ERROR = "sink_error"
+    TIMEOUT = "timeout"
+    INTERNAL_ERROR = "internal_error"
+
+
+class AccountRole(str, Enum):
+    CUSTOMER = "customer"
+    OPERATOR = "operator"
+
+
+class AuthPrincipal(BaseModel):
+    account_id: str
+    role: AccountRole = AccountRole.CUSTOMER
+
+
+def default_stage_for_request(has_find: bool) -> JobStage:
+    if has_find:
+        return JobStage.PLANNING
+    return JobStage.SUBMITTED
+
+
+def default_stage_for_status(status: JobStatus) -> JobStage:
+    if status == JobStatus.FINDING:
+        return JobStage.PLANNING
+    if status == JobStatus.PLANNED:
+        return JobStage.PLANNED
+    if status in {JobStatus.PENDING, JobStatus.QUEUED}:
+        return JobStage.QUEUED
+    if status == JobStatus.RUNNING:
+        return JobStage.RUNNING
+    if status == JobStatus.COMPLETE:
+        return JobStage.COMPLETE
+    return JobStage.FAILED
+
+
 class TransformSpec(BaseModel):
     type: str
     params: dict[str, Any] = Field(default_factory=dict)
@@ -52,8 +103,19 @@ class TransformSpec(BaseModel):
             self.type = "video.transcode"
             self.params.setdefault("codec", "h264")
             self.params.setdefault("crf", 23)
+        elif self.type == "proxy":
+            self.type = "video.transcode"
+            self.params.setdefault("codec", "h264")
+            self.params.setdefault("crf", 28)
+            self.params.setdefault("preset", "veryfast")
+        elif self.type == "remux":
+            self.type = "video.remux"
         elif self.type == "extract_frames":
             self.type = "video.extract_frames"
+        elif self.type == "develop_raw":
+            self.type = "image.develop_raw"
+        elif self.type == "remove_background":
+            self.type = "image.remove_background"
         elif self.type == "normalize":
             self.type = "audio.normalize"
         elif self.type == "resample":
@@ -92,7 +154,13 @@ class TransformSpec(BaseModel):
             else:
                 raise ValueError("transcode requires codec for video or format for audio")
 
-        if self.type == "image.resize":
+        if self.type == "image.develop_raw":
+            if self.params:
+                raise ValueError("image.develop_raw does not accept params")
+        elif self.type == "image.remove_background":
+            if self.params:
+                raise ValueError("image.remove_background does not accept params")
+        elif self.type == "image.resize":
             allowed = {"width", "height", "maintain_aspect"}
             width = self.params.get("width")
             height = self.params.get("height")
@@ -160,6 +228,17 @@ class TransformSpec(BaseModel):
                 self.params.pop("preset", None)
             else:
                 self.params["preset"] = normalized_preset
+        elif self.type == "video.remux":
+            allowed = {"container"}
+            container = self.params.get("container", "mp4")
+            if not isinstance(container, str):
+                raise ValueError("video.remux requires container")
+            normalized_container = container.strip().lower()
+            if normalized_container not in {"mp4"}:
+                raise ValueError("video.remux container must be one of mp4")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("video.remux only accepts container")
+            self.params["container"] = normalized_container
         elif self.type == "audio.transcode":
             allowed = {"format", "bitrate"}
             format_value = self.params.get("format")
@@ -294,6 +373,7 @@ class WorkSpec(BaseModel):
 
 
 class CreateJobRequest(BaseModel):
+    account_id: str = "local-dev"
     source: str
     sink: str
     find: Optional[str] = None
@@ -342,6 +422,8 @@ def _is_find_compatible_transform_chain(transforms: list[TransformSpec]) -> bool
         return False
 
     transform_types = [transform.type for transform in transforms]
+    if "video.remux" in transform_types:
+        return False
     if all(transform_type.startswith("image.") for transform_type in transform_types):
         return True
     head = transform_types[0]
@@ -439,7 +521,9 @@ class SubmitJobRequest(BaseModel):
 
 class JobRecord(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
+    account_id: str = "local-dev"
     status: JobStatus = JobStatus.PENDING
+    stage: JobStage = JobStage.SUBMITTED
     source: str
     sink: str
     find: Optional[str] = None
@@ -454,15 +538,22 @@ class JobRecord(BaseModel):
     total_bytes: Optional[int] = None
     completed_objects: int = 0
     completed_bytes: int = 0
+    outputs_written: int = 0
     current_workers: int = 0
     desired_workers: int = 0
+    worker_pool: Optional[str] = None
+    failure_category: Optional[JobFailureCategory] = None
+    failure_message: Optional[str] = None
+    events: list["JobEvent"] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
 
 class JobView(BaseModel):
     id: str
+    account_id: str
     status: JobStatus
+    stage: JobStage
     input: str
     output: str
     work: list[WorkSpec]
@@ -476,8 +567,13 @@ class JobView(BaseModel):
     total_bytes: Optional[int] = None
     completed_objects: int = 0
     completed_bytes: int = 0
+    outputs_written: int = 0
     current_workers: int = 0
     desired_workers: int = 0
+    worker_pool: Optional[str] = None
+    failure_category: Optional[JobFailureCategory] = None
+    failure_message: Optional[str] = None
+    events: list["JobEvent"] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -492,7 +588,9 @@ class JobView(BaseModel):
         )
         return cls(
             id=record.id,
+            account_id=record.account_id,
             status=record.status,
+            stage=record.stage,
             input=record.source,
             output=record.sink,
             work=work,
@@ -506,31 +604,63 @@ class JobView(BaseModel):
             total_bytes=record.total_bytes,
             completed_objects=record.completed_objects,
             completed_bytes=record.completed_bytes,
+            outputs_written=record.outputs_written,
             current_workers=record.current_workers,
             desired_workers=record.desired_workers,
+            worker_pool=record.worker_pool,
+            failure_category=record.failure_category,
+            failure_message=record.failure_message,
+            events=record.events,
             created_at=record.created_at,
             updated_at=record.updated_at,
         )
 
 
+class JobEvent(BaseModel):
+    at: datetime = Field(default_factory=utc_now)
+    type: str
+    status: Optional[JobStatus] = None
+    stage: Optional[JobStage] = None
+    message: Optional[str] = None
+    failure_category: Optional[JobFailureCategory] = None
+    failure_message: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class JobStatusUpdate(BaseModel):
     status: JobStatus
+    stage: Optional[JobStage] = None
+    failure_category: Optional[JobFailureCategory] = None
+    failure_message: Optional[str] = None
+    worker_pool: Optional[str] = None
+    event_type: Optional[str] = None
+    event_message: Optional[str] = None
+    event_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobProgressUpdate(BaseModel):
     job_id: str
     status: Optional[JobStatus] = None
+    stage: Optional[JobStage] = None
     manifest_hash: Optional[str] = None
     matched_assets: Optional[int] = None
     matched_segments: Optional[int] = None
     completed_objects: Optional[int] = None
     completed_bytes: Optional[int] = None
+    outputs_written: Optional[int] = None
     current_workers: Optional[int] = None
     desired_workers: Optional[int] = None
+    worker_pool: Optional[str] = None
     region: Optional[str] = None
     instance_type: Optional[str] = None
     total_objects: Optional[int] = None
     total_bytes: Optional[int] = None
+    failure_category: Optional[JobFailureCategory] = None
+    failure_message: Optional[str] = None
+    clear_failure: bool = False
+    event_type: Optional[str] = None
+    event_message: Optional[str] = None
+    event_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobCompletionWebhook(BaseModel):

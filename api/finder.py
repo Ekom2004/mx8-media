@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from .find_contracts import FIND_INTERACTIVE_LANE, ManifestRecord, MatchSegment
 from .find_dispatcher import FindDispatcher, record_is_image
-from .models import JobProgressUpdate, JobRecord, JobStatus
+from .models import JobFailureCategory, JobProgressUpdate, JobRecord, JobStage, JobStatus
 from .storage import JobStore
 
 LOGGER = logging.getLogger(__name__)
@@ -205,6 +205,14 @@ class JobFinder:
 
     def _submit_record(self, record: JobRecord) -> None:
         try:
+            self._store.update_job_progress(
+                JobProgressUpdate(
+                    job_id=record.id,
+                    stage=JobStage.PLANNING,
+                    event_type="planner_manifest_resolve_started",
+                    event_message="Planner started resolving the source manifest",
+                )
+            )
             source_manifest_hash, source_records = self._resolver().resolve(record.source)
             searchable_records = select_find_records(source_records, record.transforms)
             if not searchable_records:
@@ -212,13 +220,18 @@ class JobFinder:
                     JobProgressUpdate(
                         job_id=record.id,
                         status=JobStatus.COMPLETE,
+                        stage=JobStage.COMPLETE,
                         manifest_hash=source_manifest_hash,
                         matched_assets=0,
                         matched_segments=0,
                         total_objects=0,
                         total_bytes=0,
+                        outputs_written=0,
                         current_workers=0,
                         desired_workers=0,
+                        clear_failure=True,
+                        event_type="planner_completed_no_matches",
+                        event_message="Planner finished with no searchable assets",
                     )
                 )
                 return
@@ -233,14 +246,28 @@ class JobFinder:
                 video_records=searchable_records,
                 max_outputs=record.max_outputs,
             )
+            self._store.update_job_progress(
+                JobProgressUpdate(
+                    job_id=record.id,
+                    stage=JobStage.PLANNING,
+                    event_type="planner_dispatched_find_work",
+                    event_message="Planner dispatched the visual search workload",
+                    event_metadata={"searchable_records": len(searchable_records)},
+                )
+            )
         except Exception:
             LOGGER.exception("finder failed to submit job %s", record.id)
             self._store.update_job_progress(
                 JobProgressUpdate(
                     job_id=record.id,
                     status=JobStatus.FAILED,
+                    stage=JobStage.FAILED,
                     current_workers=0,
                     desired_workers=0,
+                    failure_category=JobFailureCategory.PLANNING_ERROR,
+                    failure_message="Planner failed while preparing the job",
+                    event_type="planner_failed",
+                    event_message="Planner failed while preparing the job",
                 )
             )
 
@@ -251,8 +278,13 @@ class JobFinder:
                     JobProgressUpdate(
                         job_id=record.id,
                         status=JobStatus.FAILED,
+                        stage=JobStage.FAILED,
                         current_workers=0,
                         desired_workers=0,
+                        failure_category=JobFailureCategory.PLANNING_ERROR,
+                        failure_message="Planner failed while resolving visual matches",
+                        event_type="planner_failed",
+                        event_message="Planner failed while resolving visual matches",
                     )
                 )
                 return
@@ -264,13 +296,18 @@ class JobFinder:
                     JobProgressUpdate(
                         job_id=record.id,
                         status=JobStatus.COMPLETE,
+                        stage=JobStage.COMPLETE,
                         manifest_hash=snapshot.source_manifest_hash,
                         matched_assets=0,
                         matched_segments=0,
                         total_objects=0,
                         total_bytes=0,
+                        outputs_written=0,
                         current_workers=0,
                         desired_workers=0,
+                        clear_failure=True,
+                        event_type="planner_completed_no_matches",
+                        event_message="Planner completed with no matches",
                     )
                 )
                 return
@@ -283,6 +320,7 @@ class JobFinder:
                 JobProgressUpdate(
                     job_id=record.id,
                     status=JobStatus.PLANNED,
+                    stage=JobStage.PLANNED,
                     manifest_hash=derived_manifest_hash,
                     matched_assets=matched_assets,
                     matched_segments=matched_segments,
@@ -290,6 +328,13 @@ class JobFinder:
                     total_bytes=0,
                     current_workers=0,
                     desired_workers=0,
+                    clear_failure=True,
+                    event_type="planner_completed",
+                    event_message="Planner produced a derived manifest for the matched media",
+                    event_metadata={
+                        "matched_assets": matched_assets,
+                        "matched_segments": matched_segments,
+                    },
                 )
             )
             if updated is not None and not updated.transforms:
@@ -297,8 +342,13 @@ class JobFinder:
                     JobProgressUpdate(
                         job_id=record.id,
                         status=JobStatus.COMPLETE,
+                        stage=JobStage.COMPLETE,
                         current_workers=0,
                         desired_workers=0,
+                        outputs_written=0,
+                        clear_failure=True,
+                        event_type="job_completed_without_transforms",
+                        event_message="Planner-only job completed without downstream transforms",
                     )
                 )
             elif updated is not None and should_auto_queue_after_plan():
@@ -311,8 +361,13 @@ class JobFinder:
                 JobProgressUpdate(
                     job_id=record.id,
                     status=JobStatus.FAILED,
+                    stage=JobStage.FAILED,
                     current_workers=0,
                     desired_workers=0,
+                    failure_category=JobFailureCategory.PLANNING_ERROR,
+                    failure_message="Planner failed while finalizing the job",
+                    event_type="planner_failed",
+                    event_message="Planner failed while finalizing the job",
                 )
             )
 

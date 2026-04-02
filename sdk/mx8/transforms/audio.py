@@ -24,6 +24,23 @@ def _require_non_empty(name: str, value: str) -> str:
     return normalized
 
 
+def _normalize_audio_format(format: str) -> str:
+    normalized = format.strip().lower()
+    if normalized not in {"mp3", "wav", "flac"}:
+        raise ValueError("format must be one of: mp3, wav, flac")
+    return normalized
+
+
+def transcode(*, format: str, bitrate: str = "128k") -> Transform:
+    return Transform(
+        kind="audio.transcode",
+        params={
+            "format": _normalize_audio_format(format),
+            "bitrate": _require_non_empty("bitrate", bitrate),
+        },
+    )
+
+
 def resample(*, rate: int = 16000, channels: int = 1) -> Transform:
     return Transform(
         kind="audio.resample",

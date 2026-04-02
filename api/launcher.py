@@ -476,6 +476,14 @@ def _local_binary_command(repo_root: Path, binary_name: str, features: list[str]
 
 def _rust_transform_json(transform: TransformSpec) -> dict[str, object]:
     params = dict(transform.params)
+    if transform.type == "image.develop_raw":
+        return {
+            "ImageDevelopRaw": {}
+        }
+    if transform.type == "image.remove_background":
+        return {
+            "ImageRemoveBackground": {}
+        }
     if transform.type == "image.resize":
         return {
             "ImageResize": {
@@ -504,6 +512,12 @@ def _rust_transform_json(transform: TransformSpec) -> dict[str, object]:
                 "codec": params["codec"],
                 "crf": params.get("crf", 23),
                 "preset": params.get("preset", ""),
+            }
+        }
+    if transform.type == "video.remux":
+        return {
+            "VideoRemux": {
+                "container": params.get("container", "mp4"),
             }
         }
     if transform.type == "audio.transcode":

@@ -11,12 +11,16 @@ from .transforms.audio import resample as _audio_resample
 from .transforms.audio import transcode as _audio_transcode
 from .transforms.image import convert as _image_convert
 from .transforms.image import crop as _image_crop
+from .transforms.image import develop_raw as _image_develop_raw
 from .transforms.image import filter as _image_filter
+from .transforms.image import remove_background as _image_remove_background
 from .transforms.image import resize as _image_resize
 from .transforms.audio import filter as _audio_filter
 from .transforms.video import filter as _video_filter
 from .transforms.video import resize as _video_resize
 from .transforms.video import clip as _video_clip
+from .transforms.video import proxy as _video_proxy
+from .transforms.video import remux as _video_remux
 from .transforms.video import extract_audio as _video_extract_audio
 from .transforms.video import extract_frames
 from .transforms.video import transcode as _video_transcode
@@ -79,6 +83,14 @@ def clip(*, codec: str = "h264", crf: int = 23, preset: str | None = None) -> Tr
     return _video_clip(codec=codec, crf=crf, preset=preset)
 
 
+def proxy(*, codec: str = "h264", crf: int = 28, preset: str | None = "veryfast") -> Transform:
+    return _video_proxy(codec=codec, crf=crf, preset=preset)
+
+
+def remux(*, container: str = "mp4") -> Transform:
+    return _video_remux(container=container)
+
+
 def transcode(
     *,
     codec: str | None = None,
@@ -115,6 +127,14 @@ def convert(*, format: str, quality: int = 85) -> Transform:
     return _image_convert(format=format, quality=quality)
 
 
+def develop_raw() -> Transform:
+    return _image_develop_raw()
+
+
+def remove_background() -> Transform:
+    return _image_remove_background()
+
+
 def crop(*, width: int, height: int) -> Transform:
     return _image_crop(width=width, height=height)
 
@@ -148,12 +168,16 @@ __all__ = [
     "convert",
     "crop",
     "clip",
+    "develop_raw",
     "extract_frames",
     "extract_audio",
     "filter",
     "find",
     "image",
     "normalize",
+    "proxy",
+    "remove_background",
+    "remux",
     "resample",
     "resize",
     "run",

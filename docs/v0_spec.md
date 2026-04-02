@@ -4,7 +4,7 @@ MX8 v0 is about shipping fast, reliable media work from a single package (`mx8`)
 
 ## Release goals
 
-1. **Single-entry SDK** — teams should only need the `mx8` package, not multiple package names. The SDK exposes `run` plus top-level operations like `find(...)` and `extract_frames(...)` inside an ordered `work=[...]` list. `docs/api_shape.md` is the source of truth for the public job DSL.
+1. **Single-entry SDK** — teams should only need the `mx8` package, not multiple package names. The SDK exposes `run` plus top-level transform operations like `clip(...)`, `proxy(...)`, `remux(...)`, `extract_frames(...)`, and `extract_audio(...)` inside an ordered `work=[...]` list. `docs/api_shape.md` is the source of truth for the public job DSL.
 2. **Async job lifecycle** — every job is async from day one. Customers can pause, resume, cancel, and watch progress updates through the SDK, webhooks, or CLI. We should be able to restart jobs mid-run without recomputing successful slices.
 3. **Throughput targets** — large jobs (30–100+ TB) should complete in hours, not days. That means the coordinator must be able to spin up tens of thousands of vCPUs (or a few hundred NVDEC-enabled GPUs) rapidly (target: <8 minutes to get compute warmed). Throughput monitoring (>5 GB/s per job) will be visible in the job API so customers can verify we are beating their homegrown stacks.
 
@@ -29,21 +29,25 @@ Per-team controls are essential:
 - S3 is the canonical source/sink, but the engine is storage-agnostic; connectors for Azure, GCS, on-prem, and even HTTP/FTP can be added later.
 - We monitor egress costs by region, and the billing pipeline can refund egress line items when the customer keeps data inside the region. If the job spans regions we pass a `egress_cost` field back so the user can offset it from their invoice, keeping the user’s experience at `.20/GB` consistent.
 
-## Search & analytics
+## Selection & analytics
 
-The search layer indexes transformed metadata and optionally user-provided embeddings. It ships with:
+Selection-oriented workflows such as `find(...)` may exist behind the scenes for controlled testing, but they are not part of the default v0 partner promise. The public v0 surface is transform-first:
 
-- `POST /v1/search` with a query and optional vector payload.
-- Pricing per query (target $0.02/query in v0) with usage reported alongside job costs.
-- Rate limiting tied to `max_queries_per_minute` so we can support embed-first workloads without spinning up a new compute plane.
+- image processing
+- video processing
+- audio processing
+- job visibility
+- supportable batch execution
+
+If selection/search returns to the public surface, it should come back with an explicit support line rather than as an implied default capability.
 
 ## Pricing & revenue examples
 
-- At `$0.20/GB` the 50 TB cleanup job in the API example brings in `$10,240`. Even with a 30% margin earmarked for compute + egress reimbursements, that leaves room for enterprise margins on top of search revenue (e.g., 500K queries at `$0.02/query` is another `$10K`).
+- At `$0.20/GB` the 50 TB cleanup job in the API example brings in `$10,240`. Even with a 30% margin earmarked for compute + egress reimbursements, that leaves room for enterprise margins on top of transform revenue.
 - Keep a `cloud_costs` line item per job (compute, storage I/O, egress) so clients can trace the `profit = revenue - refunds` number themselves. We will refund egress only when the customer chooses not to pay it directly, keeping the net price on the invoicing screen at `.20/GB`.
 
 ## Next steps
 
-1. Document `job` telemetry and webhook payloads so Mintlify can show live dashboards.
+1. Document `job` telemetry, failure categories, and webhook payloads so operators can explain a job from a single `job_id`.
 2. Build CLI prototypes for `mx8 job pause/resume` that talk to the same API surface as the SDK.
 3. Add sample data references (S3 paths, public datasets) so design partners can reproduce the workflows without needing private buckets.

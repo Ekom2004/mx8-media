@@ -2,6 +2,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Cursor;
 use std::io::Write;
@@ -39,6 +40,8 @@ use image::{DynamicImage, ImageFormat};
 use mx8_runtime::pipeline::{Pipeline, RuntimeCaps};
 use mx8_runtime::sink::Sink;
 use mx8_runtime::types::Batch;
+use rawler::analyze::raw_to_srgb as develop_raw_to_srgb;
+use rawler::decoders::RawDecodeParams;
 use webp_rust::ImageBuffer as WebpImageBuffer;
 use webp_rust::{encode_lossless as encode_lossless_webp, encode_lossy as encode_lossy_webp};
 
@@ -765,8 +768,17 @@ fn transform_payload_for_sink_with_slots(
         );
     }
 
+    if image_develop_raw_spec(&job_spec.transforms).is_some() {
+        image_develop_raw_stage(&job_spec.transforms)?;
+    }
+
     if job_spec.transforms.iter().all(is_image_transform) {
-        return transform_image_payload_for_sink(job_spec, source_location, payload);
+        return transform_image_payload_for_sink(
+            job_spec,
+            source_location,
+            payload,
+            transform_slots,
+        );
     }
 
     if job_spec.transforms.iter().all(is_video_transform) {
@@ -829,7 +841,20 @@ fn render_outputs_for_sink_with_plan(
 fn is_image_transform(transform: &TransformSpec) -> bool {
     matches!(
         transform,
-        TransformSpec::ImageResize { .. }
+        TransformSpec::ImageDevelopRaw
+            | TransformSpec::ImageRemoveBackground
+            | TransformSpec::ImageResize { .. }
+            | TransformSpec::ImageCrop { .. }
+            | TransformSpec::ImageConvert { .. }
+            | TransformSpec::ImageFilter { .. }
+    )
+}
+
+fn is_image_post_transform(transform: &TransformSpec) -> bool {
+    matches!(
+        transform,
+        TransformSpec::ImageRemoveBackground
+            | TransformSpec::ImageResize { .. }
             | TransformSpec::ImageCrop { .. }
             | TransformSpec::ImageConvert { .. }
             | TransformSpec::ImageFilter { .. }
@@ -839,7 +864,8 @@ fn is_image_transform(transform: &TransformSpec) -> bool {
 fn is_video_transform(transform: &TransformSpec) -> bool {
     matches!(
         transform,
-        TransformSpec::VideoResize { .. }
+        TransformSpec::VideoRemux { .. }
+            | TransformSpec::VideoResize { .. }
             | TransformSpec::VideoTranscode { .. }
             | TransformSpec::VideoExtractFrames { .. }
             | TransformSpec::VideoExtractAudio { .. }
@@ -861,12 +887,21 @@ fn transform_image_payload_for_sink(
     job_spec: &CoreJobSpec,
     source_location: &str,
     payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<u8>> {
-    let mut image = image::load_from_memory(payload)
-        .map_err(|err| anyhow::anyhow!("image decode failed for {source_location}: {err}"))?;
+    let mut image = decode_image_payload_for_transforms(
+        &job_spec.transforms,
+        source_location,
+        payload,
+        transform_slots,
+    )?;
 
     for transform in &job_spec.transforms {
         match transform {
+            TransformSpec::ImageDevelopRaw => continue,
+            TransformSpec::ImageRemoveBackground => {
+                image = remove_background_image(&image, source_location, transform_slots)?
+            }
             TransformSpec::ImageResize {
                 width,
                 height,
@@ -907,6 +942,115 @@ fn transform_image_payload_for_sink(
     )
 }
 
+fn decode_image_payload_for_transforms(
+    transforms: &[TransformSpec],
+    source_location: &str,
+    payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
+) -> Result<DynamicImage> {
+    match image::load_from_memory(payload) {
+        Ok(image) => Ok(image),
+        Err(image_err) => develop_raw_image(source_location, payload, transforms, transform_slots)
+            .map_err(|raw_err| {
+                anyhow::anyhow!(
+                    "image decode failed for {source_location}: {image_err}; raw decode fallback failed: {raw_err}"
+                )
+            }),
+    }
+}
+
+fn develop_raw_image(
+    source_location: &str,
+    payload: &[u8],
+    transforms: &[TransformSpec],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
+) -> Result<DynamicImage> {
+    if let Ok(index) = image_develop_raw_stage(transforms) {
+        if index != 0 {
+            anyhow::bail!("image.develop_raw must be the first transform in the chain");
+        }
+    }
+
+    let _permit = transform_slots.map(|slots| slots.acquire()).transpose()?;
+    let staged_input = SeekableInputFile::create(source_location, payload)?;
+    develop_raw_to_srgb(staged_input.path(), &RawDecodeParams::default())
+        .map_err(|err| anyhow::anyhow!("raw develop failed for {source_location}: {err}"))
+}
+
+fn remove_background_image(
+    image: &DynamicImage,
+    source_location: &str,
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
+) -> Result<DynamicImage> {
+    let encoded = encode_with_format(image, ImageFormat::Png)?;
+    let output = run_remove_background_helper(&encoded, source_location, transform_slots)?;
+    image::load_from_memory(&output).map_err(|err| {
+        anyhow::anyhow!("background removal decode failed for {source_location}: {err}")
+    })
+}
+
+fn remove_background_helper_python() -> OsString {
+    std::env::var_os("MX8_REMOVE_BACKGROUND_PYTHON_BIN")
+        .or_else(|| std::env::var_os("MX8_PYTHON_BIN"))
+        .unwrap_or_else(|| OsString::from("python3"))
+}
+
+fn remove_background_helper_script() -> OsString {
+    std::env::var_os("MX8_REMOVE_BACKGROUND_HELPER").unwrap_or_else(|| {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        repo_root
+            .join("scripts")
+            .join("remove_background.py")
+            .into_os_string()
+    })
+}
+
+fn run_remove_background_helper(
+    input: &[u8],
+    source_location: &str,
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
+) -> Result<Vec<u8>> {
+    let _permit = transform_slots.map(|slots| slots.acquire()).transpose()?;
+
+    let mut command = Command::new(remove_background_helper_python());
+    command
+        .arg(remove_background_helper_script())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => anyhow::anyhow!(
+            "background removal helper requires Python and scripts/remove_background.py"
+        ),
+        _ => anyhow::anyhow!(
+            "background removal helper invocation failed for {source_location}: {err}"
+        ),
+    })?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        anyhow::anyhow!("failed to open background removal helper stdin for {source_location}")
+    })?;
+    stdin.write_all(input).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to write image to background removal helper for {source_location}: {err}"
+        )
+    })?;
+    drop(stdin);
+
+    let output = child.wait_with_output().map_err(|err| {
+        anyhow::anyhow!("background removal helper failed for {source_location}: {err}")
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "background removal helper failed for {source_location}: {}",
+            stderr.trim()
+        );
+    }
+
+    Ok(output.stdout)
+}
+
 fn transform_video_payload_for_sink(
     job_spec: &CoreJobSpec,
     sample_plan: &SampleExecutionPlan,
@@ -925,6 +1069,28 @@ fn transform_video_payload_for_sink(
 
     let staged_input = SeekableInputFile::create(source_location, payload)?;
     let stream_metadata = probe_video_stream_metadata(staged_input.path(), source_location).ok();
+    if let Some(container) = video_remux_container(&job_spec.transforms) {
+        if !video_remux_safe(sample_plan, stream_metadata.as_ref(), container) {
+            anyhow::bail!(
+                "video remux requires a compatible full-file mp4/mov input with h264/h265/av1 video and optional aac audio"
+            );
+        }
+        let mut command = Command::new("ffmpeg");
+        command
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-i")
+            .arg(staged_input.path());
+        append_video_stream_copy_output_args(&mut command, container)?;
+        return run_ffmpeg_stdout_from_seekable_input(
+            command,
+            &staged_input,
+            source_location,
+            "video remux",
+            transform_slots,
+        );
+    }
     if video_stream_copy_safe(job_spec, sample_plan, stream_metadata.as_ref()) {
         let mut command = Command::new("ffmpeg");
         command
@@ -934,16 +1100,7 @@ fn transform_video_payload_for_sink(
             .arg("-i")
             .arg(staged_input.path());
         append_segment_window_output_args(&mut command, sample_plan)?;
-        command
-            .arg("-c:v")
-            .arg("copy")
-            .arg("-c:a")
-            .arg("copy")
-            .arg("-movflags")
-            .arg("frag_keyframe+empty_moov")
-            .arg("-f")
-            .arg("mp4")
-            .arg("pipe:1");
+        append_video_stream_copy_output_args(&mut command, "mp4")?;
         return run_ffmpeg_stdout_from_seekable_input(
             command,
             &staged_input,
@@ -1194,6 +1351,7 @@ fn render_video_extract_frame_chain_outputs_for_sink(
                 &chained_spec,
                 &chained_source,
                 &artifact.payload,
+                transform_slots,
             )?;
             Ok(SinkArtifact {
                 output_uri: artifact.output_uri,
@@ -1291,6 +1449,59 @@ fn video_stream_copy_safe(
         return false;
     }
     true
+}
+
+fn video_remux_container(transforms: &[TransformSpec]) -> Option<&str> {
+    match transforms {
+        [TransformSpec::VideoRemux { container }] => Some(container.as_str()),
+        _ => None,
+    }
+}
+
+fn video_remux_safe(
+    sample_plan: &SampleExecutionPlan,
+    metadata: Option<&VideoStreamMetadata>,
+    container: &str,
+) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    if container != "mp4" {
+        return false;
+    }
+    let Some(_) = normalize_video_codec(&metadata.video_codec) else {
+        return false;
+    };
+    let format_name = metadata.format_name.as_str();
+    if !(format_name.contains("mp4") || format_name.contains("mov")) {
+        return false;
+    }
+    if !matches!(metadata.audio_codec.as_deref(), None | Some("aac")) {
+        return false;
+    }
+    if sample_plan.segment_start_ms.is_some() || sample_plan.segment_end_ms.is_some() {
+        return false;
+    }
+    true
+}
+
+fn append_video_stream_copy_output_args(command: &mut Command, container: &str) -> Result<()> {
+    match container {
+        "mp4" => {
+            command
+                .arg("-c:v")
+                .arg("copy")
+                .arg("-c:a")
+                .arg("copy")
+                .arg("-movflags")
+                .arg("frag_keyframe+empty_moov")
+                .arg("-f")
+                .arg("mp4")
+                .arg("pipe:1");
+            Ok(())
+        }
+        other => anyhow::bail!("unsupported remux container {other}"),
+    }
 }
 
 fn video_filter_chain(transforms: &[TransformSpec]) -> Option<String> {
@@ -1419,6 +1630,18 @@ fn video_extract_frames_spec(transforms: &[TransformSpec]) -> Option<&TransformS
         .find(|transform| matches!(transform, TransformSpec::VideoExtractFrames { .. }))
 }
 
+fn image_develop_raw_spec(transforms: &[TransformSpec]) -> Option<&TransformSpec> {
+    transforms
+        .iter()
+        .find(|transform| matches!(transform, TransformSpec::ImageDevelopRaw))
+}
+
+fn image_remove_background_spec(transforms: &[TransformSpec]) -> Option<&TransformSpec> {
+    transforms
+        .iter()
+        .find(|transform| matches!(transform, TransformSpec::ImageRemoveBackground))
+}
+
 fn video_extract_audio_stage(transforms: &[TransformSpec]) -> Result<(usize, &str)> {
     let Some(index) = transforms
         .iter()
@@ -1447,10 +1670,24 @@ fn video_extract_frames_stage(transforms: &[TransformSpec]) -> Result<(usize, &s
     let TransformSpec::VideoExtractFrames { format, .. } = &transforms[index] else {
         unreachable!("position matched video.extract_frames");
     };
-    if !transforms[index + 1..].iter().all(is_image_transform) {
+    if !transforms[index + 1..].iter().all(is_image_post_transform) {
         anyhow::bail!("video.extract_frames can only be followed by image transforms");
     }
     Ok((index, format.as_str()))
+}
+
+fn image_develop_raw_stage(transforms: &[TransformSpec]) -> Result<usize> {
+    let Some(index) = transforms
+        .iter()
+        .position(|transform| matches!(transform, TransformSpec::ImageDevelopRaw))
+    else {
+        anyhow::bail!("missing image.develop_raw transform");
+    };
+
+    if !transforms[index + 1..].iter().all(is_image_post_transform) {
+        anyhow::bail!("image.develop_raw can only be followed by image transforms");
+    }
+    Ok(index)
 }
 
 fn ffmpeg_video_codec(codec: &str) -> Result<&'static str> {
@@ -1997,6 +2234,63 @@ fn normalized_image_extension(ext: &str) -> String {
 }
 
 fn output_extension(transforms: &[TransformSpec], source_location: &str) -> String {
+    if image_remove_background_spec(transforms).is_some() {
+        if let Some(converted) = transforms
+            .iter()
+            .rev()
+            .find_map(|transform| match transform {
+                TransformSpec::ImageConvert { format, .. } => {
+                    match normalize_image_format(format) {
+                        Some(normalized) => Some(normalized.to_string()),
+                        None => Some(normalized_image_extension(format)),
+                    }
+                }
+                _ => None,
+            })
+        {
+            return converted;
+        }
+        return "png".to_string();
+    }
+
+    if image_develop_raw_stage(transforms).is_ok() {
+        if let Some(converted) = transforms
+            .iter()
+            .rev()
+            .find_map(|transform| match transform {
+                TransformSpec::ImageConvert { format, .. } => {
+                    match normalize_image_format(format) {
+                        Some(normalized) => Some(normalized.to_string()),
+                        None => Some(normalized_image_extension(format)),
+                    }
+                }
+                _ => None,
+            })
+        {
+            return converted;
+        }
+        return "jpg".to_string();
+    }
+
+    if is_probable_raw_source(source_location) {
+        if let Some(converted) = transforms
+            .iter()
+            .rev()
+            .find_map(|transform| match transform {
+                TransformSpec::ImageConvert { format, .. } => {
+                    match normalize_image_format(format) {
+                        Some(normalized) => Some(normalized.to_string()),
+                        None => Some(normalized_image_extension(format)),
+                    }
+                }
+                _ => None,
+            })
+        {
+            return converted;
+        }
+        return "jpg".to_string();
+    }
+
     if let Ok((_, format)) = video_extract_frames_stage(transforms) {
         if let Some(converted) = transforms
             .iter()
@@ -2031,6 +2325,7 @@ fn output_extension(transforms: &[TransformSpec], source_location: &str) -> Stri
             Some(normalized) => normalized.to_string(),
             None => normalized_image_extension(format),
         },
+        Some(TransformSpec::VideoRemux { container }) => container.clone(),
         Some(TransformSpec::VideoTranscode { .. } | TransformSpec::VideoResize { .. }) => {
             "mp4".to_string()
         }
@@ -2043,6 +2338,38 @@ fn synthesized_media_location(source_location: &str, extension: &str) -> String 
     let base_name = source_basename_without_extension(source_location)
         .unwrap_or_else(|| "artifact".to_string());
     format!("{base_name}.{extension}")
+}
+
+fn is_probable_raw_source(source_location: &str) -> bool {
+    matches!(
+        source_extension(source_location)
+            .as_deref()
+            .map(|ext| ext.to_ascii_lowercase()),
+        Some(ext)
+            if matches!(
+                ext.as_str(),
+                "3fr"
+                    | "arw"
+                    | "cr2"
+                    | "cr3"
+                    | "dng"
+                    | "erf"
+                    | "iiq"
+                    | "kdc"
+                    | "mos"
+                    | "mrw"
+                    | "nef"
+                    | "nrw"
+                    | "orf"
+                    | "pef"
+                    | "raf"
+                    | "raw"
+                    | "rw2"
+                    | "sr2"
+                    | "srf"
+                    | "x3f"
+            )
+    )
 }
 
 fn job_spec_with_transforms(job_spec: &CoreJobSpec, transforms: Vec<TransformSpec>) -> CoreJobSpec {
@@ -2063,6 +2390,9 @@ fn transform_tag(transforms: &[TransformSpec]) -> String {
     transforms
         .iter()
         .map(|transform| match transform {
+            TransformSpec::ImageDevelopRaw => "develop_raw",
+            TransformSpec::ImageRemoveBackground => "remove_background",
+            TransformSpec::VideoRemux { .. } => "remux",
             TransformSpec::VideoTranscode { .. } => "transcode",
             TransformSpec::VideoResize { .. } => "resize",
             TransformSpec::VideoExtractFrames { .. } => "frames",
@@ -2756,7 +3086,7 @@ mod tests {
         ManifestSource, SampleExecutionPlan, TransformProcessLimiter, TransformSpec,
         VideoStreamMetadata,
     };
-    use image::{DynamicImage, GenericImageView, ImageFormat};
+    use image::{DynamicImage, GenericImageView, ImageFormat, Rgba, RgbaImage};
     use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
     use mx8_proto::v0::{
         GetJobSnapshotRequest, GetJobSnapshotResponse, GetManifestRequest, GetManifestResponse,
@@ -2770,7 +3100,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::process::Command;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Instant;
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_stream::Stream;
@@ -2924,6 +3254,72 @@ mod tests {
         let mut cursor = Cursor::new(Vec::new());
         image.write_to(&mut cursor, format).expect("encode image");
         cursor.into_inner()
+    }
+
+    fn image_with_white_background_and_red_square(format: ImageFormat) -> Vec<u8> {
+        let mut image = RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255]));
+        for x in 2..6 {
+            for y in 2..6 {
+                image.put_pixel(x, y, Rgba([220, 20, 60, 255]));
+            }
+        }
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut cursor, format)
+            .expect("encode image");
+        cursor.into_inner()
+    }
+
+    fn remove_background_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn write_mock_remove_background_helper(path: &Path) {
+        let script = r#"#!/usr/bin/env python3
+import io
+import sys
+from PIL import Image
+
+img = Image.open(io.BytesIO(sys.stdin.buffer.read())).convert("RGBA")
+pixels = []
+for r, g, b, a in img.getdata():
+    if r > 240 and g > 240 and b > 240:
+        pixels.append((r, g, b, 0))
+    else:
+        pixels.append((r, g, b, 255))
+img.putdata(pixels)
+buf = io.BytesIO()
+img.save(buf, format="PNG")
+sys.stdout.buffer.write(buf.getvalue())
+"#;
+        std::fs::write(path, script).expect("write mock remove background helper");
+    }
+
+    fn with_mock_remove_background_helper<T>(root: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = remove_background_env_lock()
+            .lock()
+            .expect("remove background env lock");
+        let helper = root.join("mock_remove_background.py");
+        write_mock_remove_background_helper(&helper);
+
+        let prev_helper = std::env::var_os("MX8_REMOVE_BACKGROUND_HELPER");
+        let prev_python = std::env::var_os("MX8_REMOVE_BACKGROUND_PYTHON_BIN");
+        std::env::set_var("MX8_REMOVE_BACKGROUND_HELPER", &helper);
+        std::env::set_var("MX8_REMOVE_BACKGROUND_PYTHON_BIN", "python3");
+
+        let result = f();
+
+        match prev_helper {
+            Some(value) => std::env::set_var("MX8_REMOVE_BACKGROUND_HELPER", value),
+            None => std::env::remove_var("MX8_REMOVE_BACKGROUND_HELPER"),
+        }
+        match prev_python {
+            Some(value) => std::env::set_var("MX8_REMOVE_BACKGROUND_PYTHON_BIN", value),
+            None => std::env::remove_var("MX8_REMOVE_BACKGROUND_PYTHON_BIN"),
+        }
+
+        result
     }
 
     fn video_tools_available() -> bool {
@@ -3308,6 +3704,65 @@ mod tests {
     }
 
     #[test]
+    fn image_remove_background_defaults_output_to_png_with_transparency() {
+        let root = temp_test_dir("image-remove-background");
+        let payload = image_with_white_background_and_red_square(ImageFormat::Png);
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::ImageRemoveBackground],
+        };
+
+        with_mock_remove_background_helper(&root, || {
+            let transformed =
+                transform_payload_for_sink(&spec, "s3://in/sample.png", payload.as_slice())
+                    .expect("remove background transform");
+            assert!(transformed.starts_with(b"\x89PNG\r\n\x1a\n"));
+            let decoded = image::load_from_memory(&transformed)
+                .expect("decode remove background output")
+                .to_rgba8();
+            assert_eq!(decoded.get_pixel(0, 0).0[3], 0);
+            assert_eq!(decoded.get_pixel(3, 3).0[3], 255);
+        });
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn image_remove_background_then_convert_rewrites_output_format() {
+        let root = temp_test_dir("image-remove-background-convert");
+        let payload = image_with_white_background_and_red_square(ImageFormat::Png);
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![
+                TransformSpec::ImageRemoveBackground,
+                TransformSpec::ImageConvert {
+                    format: "webp".to_string(),
+                    quality: 85,
+                },
+            ],
+        };
+
+        with_mock_remove_background_helper(&root, || {
+            let transformed =
+                transform_payload_for_sink(&spec, "s3://in/sample.png", payload.as_slice())
+                    .expect("remove background transform");
+            assert!(transformed.starts_with(b"RIFF"));
+            assert_eq!(
+                output_extension(&spec.transforms, "s3://in/sample.png"),
+                "webp".to_string()
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn image_resize_preserves_bmp_output_when_source_is_bmp() {
         let payload = image_bytes(10, 6, ImageFormat::Bmp);
         let spec = CoreJobSpec {
@@ -3545,6 +4000,81 @@ mod tests {
         assert_eq!(audio_codec, "aac");
         let duration_secs = ffprobe_media_duration_secs(&output_path);
         assert!(duration_secs >= 0.9 && duration_secs <= 1.1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_remux_full_file_keeps_valid_output() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("video-remux-full-file");
+        let input_path = root.join("input.mp4");
+        let output_path = root.join("output.mp4");
+        write_ffmpeg_test_video_with_audio(&input_path, 128, 72);
+        let payload = std::fs::read(&input_path).expect("read input video");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::VideoRemux {
+                container: "mp4".to_string(),
+            }],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.mp4", payload.as_slice())
+                .expect("remux");
+        std::fs::write(&output_path, transformed).expect("write output video");
+        let (width, height, codec) = ffprobe_video_stream(&output_path);
+        assert_eq!((width, height), (128, 72));
+        assert_eq!(codec, "h264");
+        let audio_codec = ffprobe_audio_stream(&output_path);
+        assert_eq!(audio_codec, "aac");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_remux_rejects_segment_windows() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("video-remux-segment-reject");
+        let input_path = root.join("input.mp4");
+        write_ffmpeg_test_video_with_audio(&input_path, 128, 72);
+        let payload = std::fs::read(&input_path).expect("read input video");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::VideoRemux {
+                container: "mp4".to_string(),
+            }],
+        };
+        let sample_plan = SampleExecutionPlan {
+            source_location: "s3://in/sample.mp4".to_string(),
+            segment_start_ms: Some(500),
+            segment_end_ms: Some(1_000),
+        };
+
+        let err = super::transform_payload_for_sink_with_slots(
+            &spec,
+            &sample_plan,
+            payload.as_slice(),
+            None,
+        )
+        .expect_err("expected remux to reject segment windows");
+        assert!(
+            err.to_string()
+                .contains("video remux requires a compatible full-file"),
+            "unexpected error: {err}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3874,6 +4404,90 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn image_develop_raw_defaults_output_to_jpg() {
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::ImageDevelopRaw],
+        };
+
+        assert_eq!(
+            output_extension(&spec.transforms, "s3://in/frame.CR2"),
+            "jpg".to_string()
+        );
+    }
+
+    #[test]
+    fn raw_source_without_develop_raw_defaults_output_to_jpg() {
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::ImageResize {
+                width: 2048,
+                height: 2048,
+                maintain_aspect: true,
+            }],
+        };
+
+        assert_eq!(
+            output_extension(&spec.transforms, "s3://in/frame.CR2"),
+            "jpg".to_string()
+        );
+    }
+
+    #[test]
+    fn image_develop_raw_then_image_convert_rewrites_output_format() {
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![
+                TransformSpec::ImageDevelopRaw,
+                TransformSpec::ImageConvert {
+                    format: "webp".to_string(),
+                    quality: 85,
+                },
+            ],
+        };
+
+        assert_eq!(
+            output_extension(&spec.transforms, "s3://in/frame.NEF"),
+            "webp".to_string()
+        );
+    }
+
+    #[test]
+    fn raw_source_without_develop_raw_respects_image_convert_format() {
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![
+                TransformSpec::ImageResize {
+                    width: 2048,
+                    height: 2048,
+                    maintain_aspect: true,
+                },
+                TransformSpec::ImageConvert {
+                    format: "webp".to_string(),
+                    quality: 85,
+                },
+            ],
+        };
+
+        assert_eq!(
+            output_extension(&spec.transforms, "s3://in/frame.NEF"),
+            "webp".to_string()
+        );
     }
 
     #[test]
@@ -4293,6 +4907,52 @@ mod tests {
             .contains("video.extract_frames can only be followed by image transforms"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn image_develop_raw_rejects_non_image_followups() {
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![
+                TransformSpec::ImageDevelopRaw,
+                TransformSpec::AudioNormalize {
+                    loudness_lufs: -14.0,
+                },
+            ],
+        };
+
+        let err = transform_payload_for_sink(&spec, "s3://in/frame.CR2", b"")
+            .expect_err("expected invalid develop_raw followup to fail");
+        assert!(err
+            .to_string()
+            .contains("image.develop_raw can only be followed by image transforms"));
+    }
+
+    #[test]
+    fn image_develop_raw_must_be_first_in_chain() {
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![
+                TransformSpec::ImageResize {
+                    width: 16,
+                    height: 16,
+                    maintain_aspect: true,
+                },
+                TransformSpec::ImageDevelopRaw,
+            ],
+        };
+
+        let err = transform_payload_for_sink(&spec, "s3://in/frame.CR2", b"")
+            .expect_err("expected develop_raw ordering error");
+        assert!(err
+            .to_string()
+            .contains("image.develop_raw must be the first transform in the chain"));
     }
 
     #[test]

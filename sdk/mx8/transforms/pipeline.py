@@ -28,6 +28,18 @@ class TransformChain:
 
 
 class VideoTransformPipeline(TransformChain):
+    def proxy(
+        self,
+        *,
+        codec: str = "h264",
+        crf: int = 28,
+        preset: str | None = "veryfast",
+    ) -> VideoTransformPipeline:
+        return self.append(video_module.proxy(codec=codec, crf=crf, preset=preset))
+
+    def remux(self, *, container: str = "mp4") -> VideoTransformPipeline:
+        return self.append(video_module.remux(container=container))
+
     def clip(self, *, codec: str = "h264", crf: int = 23, preset: str | None = None) -> VideoTransformPipeline:
         return self.append(video_module.clip(codec=codec, crf=crf, preset=preset))
 
@@ -72,6 +84,12 @@ class AudioTransformPipeline(TransformChain):
 
 
 class ImageTransformPipeline(TransformChain):
+    def remove_background(self) -> ImageTransformPipeline:
+        return self.append(image_module.remove_background())
+
+    def develop_raw(self) -> ImageTransformPipeline:
+        return self.append(image_module.develop_raw())
+
     def resize(self, *, width: int, height: int, maintain_aspect: bool = True) -> ImageTransformPipeline:
         return self.append(
             image_module.resize(width=width, height=height, maintain_aspect=maintain_aspect)
@@ -88,6 +106,18 @@ class ImageTransformPipeline(TransformChain):
 
 
 class _VideoTransformsFactory:
+    def proxy(
+        self,
+        *,
+        codec: str = "h264",
+        crf: int = 28,
+        preset: str | None = "veryfast",
+    ) -> VideoTransformPipeline:
+        return VideoTransformPipeline().proxy(codec=codec, crf=crf, preset=preset)
+
+    def remux(self, *, container: str = "mp4") -> VideoTransformPipeline:
+        return VideoTransformPipeline().remux(container=container)
+
     def clip(self, *, codec: str = "h264", crf: int = 23, preset: str | None = None) -> VideoTransformPipeline:
         return VideoTransformPipeline().clip(codec=codec, crf=crf, preset=preset)
 
@@ -125,6 +155,12 @@ class _AudioTransformsFactory:
 
 
 class _ImageTransformsFactory:
+    def remove_background(self) -> ImageTransformPipeline:
+        return ImageTransformPipeline().remove_background()
+
+    def develop_raw(self) -> ImageTransformPipeline:
+        return ImageTransformPipeline().develop_raw()
+
     def resize(self, *, width: int, height: int, maintain_aspect: bool = True) -> ImageTransformPipeline:
         return ImageTransformPipeline().resize(width=width, height=height, maintain_aspect=maintain_aspect)
 

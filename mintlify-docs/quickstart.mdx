@@ -1,0 +1,79 @@
+---
+title: "Quickstart"
+description: "Run your first MX8 transform job."
+---
+
+# Quickstart
+
+## Install
+
+```bash
+pip install mx8
+```
+
+## First image job
+
+```python
+import mx8
+
+job = mx8.run(
+    input="s3://catalog-images/",
+    work=[
+        mx8.crop(width=1200, height=1200),
+        mx8.resize(width=1024, height=1024, media="image"),
+        mx8.convert(format="webp", quality=85),
+    ],
+    output="s3://catalog-images-web/",
+)
+
+job.wait()
+```
+
+## First video job
+
+```python
+import mx8
+
+job = mx8.run(
+    input="s3://raw-video/",
+    work=[
+        mx8.proxy(),
+    ],
+    output="s3://review-proxies/",
+)
+
+job.wait()
+```
+
+## Track the job
+
+```python
+job = job.poll()
+
+print(job.status)
+print(job.stage)
+print(job.outputs_written)
+print(job.failure_category)
+print(job.failure_message)
+```
+
+If a partner gives you a `job.id`, those fields should tell you the operator story without opening raw logs first.
+
+## Operator view
+
+```bash
+mx8 ops watch <job_id>
+mx8 ops live
+```
+
+- `watch` follows one job live
+- `live` shows the active fleet view
+
+Example:
+
+```text
+JOB       STATUS   STAGE    POOL           OUTPUTS  WORKERS  LAST_EVENT           UPDATED
+--------  -------  -------  -------------  -------  -------  -------------------  -------------------
+job_a123  RUNNING  RUNNING  image-default  8400     4/4      job_running          2026-03-29T14:07...
+job_b456  QUEUED   QUEUED   video-default  0        0/2      worker_plan_updated  2026-03-29T14:08...
+```

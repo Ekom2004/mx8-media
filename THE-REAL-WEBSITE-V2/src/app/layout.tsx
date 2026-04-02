@@ -1,17 +1,5 @@
 import type { Metadata } from 'next';
-import { IBM_Plex_Sans, IBM_Plex_Sans_Condensed } from 'next/font/google';
 import './globals.css';
-
-const ibmPlexSans = IBM_Plex_Sans({
-  subsets: ['latin'],
-  weight: ['400', '500', '600', '700'],
-});
-
-const ibmPlexSansCondensed = IBM_Plex_Sans_Condensed({
-  subsets: ['latin'],
-  weight: ['600', '700'],
-  variable: '--font-heading',
-});
 
 export const metadata: Metadata = {
   title: 'MX8 | Media Transforms at Scale',
@@ -25,7 +13,15 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className="dark">
-      <body className={`${ibmPlexSans.className} ${ibmPlexSansCondensed.variable} bg-[#09090b] text-white selection:bg-zinc-800 selection:text-white`}>
+      <body
+        className="bg-[#09090b] font-sans text-white selection:bg-zinc-800 selection:text-white"
+        style={
+          {
+            "--font-heading":
+              '"IBM Plex Sans Condensed", "IBM Plex Sans", "Arial Narrow", sans-serif',
+          } as React.CSSProperties
+        }
+      >
         {children}
       </body>
     </html>

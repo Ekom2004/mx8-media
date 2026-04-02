@@ -1,5 +1,7 @@
 # MX8 `find` v1
 
+`find` currently exists as an experimental selection workflow for controlled testing. It is not part of the default public transform-first promise.
+
 ## Public API
 
 MX8 exposes semantic selection as a `find` work item inside `mx8.run(...)`:
@@ -9,9 +11,9 @@ mx8.run(
     input="s3://raw-dashcam-archive/",
     work=[
         mx8.find("a stop sign covered in heavy snow"),
-        mx8.extract_frames(fps=10, format="jpg"),
+        mx8.clip(),
     ],
-    output="s3://training-dataset/",
+    output="s3://review-clips/",
 )
 ```
 
@@ -60,6 +62,8 @@ The planner resolves `find` into a derived manifest. Agent-facing jobs stay tran
 
 v1 supports:
 
+- `find + video + clip()`
+- `find + video + transcode(...)`
 - `find + video + extract_frames(...)`
 
 Out of scope for v1:

@@ -69,26 +69,39 @@ message JobSpec {
 
 message Transform {
   oneof kind {
-    VideoTranscode video_transcode = 1;
-    VideoResize video_resize = 2;
-    VideoExtractFrames video_extract_frames = 3;
-    VideoExtractAudio video_extract_audio = 4;
-    ImageResize image_resize = 5;
-    ImageConvert image_convert = 6;
-    AudioResample audio_resample = 7;
-    AudioNormalize audio_normalize = 8;
-    ImageCrop image_crop = 9;
-    VideoFilter video_filter = 10;
-    AudioFilter audio_filter = 11;
-    ImageFilter image_filter = 12;
-    AudioTranscode audio_transcode = 13;
+    ImageDevelopRaw image_develop_raw = 1;
+    ImageRemoveBackground image_remove_background = 2;
+    VideoTranscode video_transcode = 4;
+    VideoRemux video_remux = 5;
+    VideoResize video_resize = 6;
+    VideoExtractFrames video_extract_frames = 7;
+    VideoExtractAudio video_extract_audio = 8;
+    ImageResize image_resize = 9;
+    ImageConvert image_convert = 10;
+    AudioResample audio_resample = 11;
+    AudioNormalize audio_normalize = 12;
+    ImageCrop image_crop = 13;
+    VideoFilter video_filter = 14;
+    AudioFilter audio_filter = 15;
+    ImageFilter image_filter = 16;
+    AudioTranscode audio_transcode = 17;
   }
+}
+
+message ImageDevelopRaw {
+}
+
+message ImageRemoveBackground {
 }
 
 message VideoTranscode {
   string codec = 1;
   uint32 crf = 2;
   string preset = 3;
+}
+
+message VideoRemux {
+  string container = 1;
 }
 
 message VideoResize {

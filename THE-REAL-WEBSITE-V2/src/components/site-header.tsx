@@ -1,7 +1,7 @@
 import Link from "next/link";
 
 type SiteHeaderProps = {
-  current?: "home" | "about";
+  current?: "home" | "use-cases" | "about";
 };
 
 function MX8Mark() {
@@ -34,6 +34,14 @@ export function SiteHeader({ current = "home" }: SiteHeaderProps) {
         <MX8Mark /> MX8
       </Link>
       <nav className="flex items-center gap-6 text-sm text-zinc-400">
+        <Link
+          href="/use-cases"
+          className={`transition-colors hover:text-white ${
+            current === "use-cases" ? "text-white" : ""
+          }`}
+        >
+          Use Cases
+        </Link>
         <Link
           href="/about"
           className={`transition-colors hover:text-white ${

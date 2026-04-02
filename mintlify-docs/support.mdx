@@ -1,0 +1,50 @@
+---
+title: "Support Matrix"
+description: "What MX8 supports today, what is experimental, and what is not yet public."
+---
+
+# Support Matrix
+
+## Supported
+
+- canonical `input / work / output` jobs
+- image transforms
+- video transforms
+- audio transforms
+- S3-first remote workflows
+- local development workflows
+- support-grade job visibility by `job_id`
+
+## Experimental
+
+- `find(...)` selection workflows
+- search-led planner flows
+- GCS and Azure usage outside controlled testing
+- very large custom multi-TB media jobs that need manual fleet review
+
+Experimental means:
+
+- it may work
+- it may be useful
+- it is not the default public promise
+
+## Not yet public
+
+- public `/v1/search`
+- OCR-backed search
+- reranking and temporal reasoning features
+- public worker-pool selection
+- self-serve guarantees for jobs above 5 TB
+
+## Failure categories
+
+Jobs can currently fail with categories like:
+
+- `input_error`
+- `auth_error`
+- `planning_error`
+- `capacity_error`
+- `worker_error`
+- `sink_error`
+- `timeout`
+- `internal_error`

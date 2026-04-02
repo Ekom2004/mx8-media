@@ -50,10 +50,15 @@ impl JobSpec {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransformSpec {
+    ImageDevelopRaw,
+    ImageRemoveBackground,
     VideoTranscode {
         codec: String,
         crf: u32,
         preset: Option<String>,
+    },
+    VideoRemux {
+        container: String,
     },
     VideoResize {
         width: u32,
@@ -106,6 +111,8 @@ pub enum TransformSpec {
 impl TransformSpec {
     pub fn validate(&self) -> Result<(), TransformSpecError> {
         match self {
+            Self::ImageDevelopRaw => {}
+            Self::ImageRemoveBackground => {}
             Self::VideoTranscode { codec, crf, preset } => {
                 if normalize_video_codec(codec).is_none() {
                     return Err(TransformSpecError::UnsupportedVideoCodec(
@@ -125,6 +132,13 @@ impl TransformSpec {
                             preset: normalized_preset.to_string(),
                         });
                     }
+                }
+            }
+            Self::VideoRemux { container } => {
+                if normalize_video_container(container).is_none() {
+                    return Err(TransformSpecError::UnsupportedVideoContainer(
+                        container.trim().to_string(),
+                    ));
                 }
             }
             Self::VideoResize { width, height, .. }
@@ -206,6 +220,13 @@ pub fn normalize_video_codec(codec: &str) -> Option<&'static str> {
         "h264" => Some("h264"),
         "h265" | "hevc" => Some("h265"),
         "av1" => Some("av1"),
+        _ => None,
+    }
+}
+
+pub fn normalize_video_container(container: &str) -> Option<&'static str> {
+    match container.trim().to_ascii_lowercase().as_str() {
+        "mp4" => Some("mp4"),
         _ => None,
     }
 }
@@ -385,6 +406,8 @@ pub enum TransformSpecError {
     UnsupportedVideoPreset(String),
     #[error("video preset {preset} is not supported for codec {codec}")]
     VideoPresetUnsupportedForCodec { codec: String, preset: String },
+    #[error("video container must be one of mp4 (got {0})")]
+    UnsupportedVideoContainer(String),
     #[error("audio format must be one of mp3, wav, flac (got {0})")]
     UnsupportedAudioFormat(String),
     #[error("frame format must be one of jpg, png (got {0})")]
@@ -432,11 +455,7 @@ mod tests {
             source_uri: "s3://in/".to_string(),
             sink_uri: "s3://out/".to_string(),
             aws_region: "us-east-1".to_string(),
-            transforms: vec![TransformSpec::ImageResize {
-                width: 64,
-                height: 64,
-                maintain_aspect: true,
-            }],
+            transforms: vec![TransformSpec::ImageDevelopRaw],
         }
     }
 
@@ -498,6 +517,19 @@ mod tests {
         assert_eq!(err, TransformSpecError::ImageQualityOutOfRange(101));
     }
 
+    fn image_develop_raw_validate_succeeds() {
+        TransformSpec::ImageDevelopRaw
+            .validate()
+            .expect("image.develop_raw should validate");
+    }
+
+    #[test]
+    fn image_remove_background_validate_succeeds() {
+        TransformSpec::ImageRemoveBackground
+            .validate()
+            .expect("image.remove_background should validate");
+    }
+
     #[test]
     fn video_transcode_validate_rejects_unsupported_codec() {
         let err = TransformSpec::VideoTranscode {
@@ -525,6 +557,19 @@ mod tests {
         assert_eq!(
             err,
             TransformSpecError::UnsupportedVideoPreset("turbo".to_string())
+        );
+    }
+
+    #[test]
+    fn video_remux_validate_rejects_unsupported_container() {
+        let err = TransformSpec::VideoRemux {
+            container: "mkv".to_string(),
+        }
+        .validate()
+        .expect_err("expected unsupported container");
+        assert_eq!(
+            err,
+            TransformSpecError::UnsupportedVideoContainer("mkv".to_string())
         );
     }
 

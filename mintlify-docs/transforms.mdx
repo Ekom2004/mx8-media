@@ -1,0 +1,115 @@
+---
+title: "Transforms"
+description: "First-class MX8 transform workflows."
+---
+
+# Transforms
+
+MX8 exposes one ordered `work=[...]` list with first-class transform operations. The point is to describe the media job itself, not the worker fleet behind it.
+
+## Image
+
+```python
+mx8.run(
+    input="s3://camera-raw/",
+    work=[
+        mx8.resize(width=2048, height=2048, media="image"),
+        mx8.convert(format="jpg", quality=90),
+    ],
+    output="s3://standard-images/",
+)
+```
+
+Supported image transforms:
+
+- `remove_background()`
+- `resize(..., media="image")`
+- `crop(...)`
+- `convert(...)`
+- `filter(..., media="image")`
+
+RAW inputs are decoded into a standard image internally when they enter the image pipeline and default to JPEG unless a later `convert(...)` changes the output format.
+
+```python
+mx8.run(
+    input="s3://product-images/",
+    work=[
+        mx8.remove_background(),
+        mx8.convert(format="png"),
+    ],
+    output="s3://cutouts/",
+)
+```
+
+`remove_background()` removes image backgrounds and defaults to PNG output unless a later `convert(...)` changes the output format. The worker environment needs Python plus `rembg` available for the helper script in `scripts/remove_background.py`.
+
+## Video
+
+### Proxy review copies
+
+```python
+mx8.run(
+    input="s3://raw-video/",
+    work=[
+        mx8.proxy(),
+    ],
+    output="s3://review-proxies/",
+)
+```
+
+Use `proxy()` when the team needs lighter review copies without hand-tuning a transcode preset every time.
+
+### Remux compatible sources
+
+```python
+mx8.run(
+    input="s3://incoming-media/",
+    work=[
+        mx8.remux(container="mp4"),
+    ],
+    output="s3://rewrapped-media/",
+)
+```
+
+Use `remux()` when the streams are already acceptable and only the container needs to change.
+
+Supported video transforms:
+
+- `clip()`
+- `proxy()`
+- `remux(container="mp4")`
+- `transcode(codec=...)`
+- `extract_frames(...)`
+- `extract_audio(...)`
+- `resize(..., media="video")`
+- `filter(..., media="video")`
+
+### Notes
+
+- `proxy()` is an opinionated video transcode workflow with defaults:
+  - codec `h264`
+  - `crf=28`
+  - `preset="veryfast"`
+- `remux()` is full-file stream-copy repackaging only.
+- `find -> remux` is intentionally not supported.
+
+## Audio
+
+```python
+mx8.run(
+    input="s3://interviews/",
+    work=[
+        mx8.extract_audio(format="wav", bitrate="192k"),
+        mx8.resample(rate=16000, channels=1),
+        mx8.normalize(loudness=-14.0),
+    ],
+    output="s3://clean-audio/",
+)
+```
+
+Supported audio transforms:
+
+- `transcode(format=...)`
+- `resample(...)`
+- `normalize(...)`
+- `filter(..., media="audio")`

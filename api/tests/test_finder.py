@@ -13,7 +13,7 @@ from api.find_contracts import FindShard, FindShardResult, FindShardStats, Manif
 from api.find_access import PassthroughSourceAccessResolver
 from api.find_dispatcher import FindDispatcher, FindTransport
 from api.finder import JobFinder, LocalFsManifestStore, parse_canonical_manifest_tsv
-from api.models import CreateJobRequest, JobStatus, TransformSpec
+from api.models import CreateJobRequest, JobFailureCategory, JobStage, JobStatus, TransformSpec
 from api.storage import InMemoryJobStore
 
 
@@ -118,11 +118,13 @@ class FinderTests(unittest.TestCase):
         self.assertIsNotNone(updated)
         assert updated is not None
         self.assertEqual(updated.status, JobStatus.PLANNED)
+        self.assertEqual(updated.stage, JobStage.PLANNED)
         self.assertEqual(updated.matched_assets, 1)
         self.assertEqual(updated.matched_segments, 2)
         self.assertEqual(updated.total_objects, 2)
         self.assertEqual(updated.total_bytes, 0)
         self.assertIsNotNone(updated.manifest_hash)
+        self.assertEqual(updated.events[-1].type, "planner_completed")
 
         manifest_store = LocalFsManifestStore.from_env()
         manifest_bytes = manifest_store.get_manifest_bytes(updated.manifest_hash or "")
@@ -232,6 +234,7 @@ class FinderTests(unittest.TestCase):
         self.assertIsNotNone(updated)
         assert updated is not None
         self.assertEqual(updated.status, JobStatus.COMPLETE)
+        self.assertEqual(updated.stage, JobStage.COMPLETE)
         self.assertEqual(updated.matched_assets, 0)
         self.assertEqual(updated.matched_segments, 0)
         self.assertEqual(updated.total_objects, 0)
@@ -246,6 +249,18 @@ class FinderTests(unittest.TestCase):
             transforms=[TransformSpec(type="video.transcode", params={"codec": "h264", "crf": 23})],
         )
         self.assertEqual(request.transforms[0].type, "video.transcode")
+
+    def test_find_rejects_video_remux(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "find requires a visual-compatible transform chain",
+        ):
+            CreateJobRequest(
+                source="s3://raw-dashcam-archive/",
+                sink="s3://rewrapped-media/",
+                find="match",
+                transforms=[TransformSpec(type="video.remux", params={"container": "mp4"})],
+            )
 
     def test_find_allows_video_extract_frames_followed_by_image_transforms(self) -> None:
         request = CreateJobRequest(
@@ -375,6 +390,7 @@ class FinderTests(unittest.TestCase):
         self.assertIsNotNone(updated)
         assert updated is not None
         self.assertEqual(updated.status, JobStatus.PENDING)
+        self.assertEqual(updated.stage, JobStage.QUEUED)
         self.assertEqual(updated.matched_assets, 1)
         self.assertEqual(updated.matched_segments, 1)
         self.assertEqual(wake_calls, ["wake"])
@@ -427,6 +443,7 @@ class FinderTests(unittest.TestCase):
         self.assertIsNotNone(updated)
         assert updated is not None
         self.assertEqual(updated.status, JobStatus.PLANNED)
+        self.assertEqual(updated.stage, JobStage.PLANNED)
         self.assertEqual(updated.matched_assets, 1)
         self.assertEqual(updated.matched_segments, 1)
         manifest_store = LocalFsManifestStore.from_env()
@@ -477,8 +494,37 @@ class FinderTests(unittest.TestCase):
         self.assertIsNotNone(updated)
         assert updated is not None
         self.assertEqual(updated.status, JobStatus.COMPLETE)
+        self.assertEqual(updated.stage, JobStage.COMPLETE)
         self.assertEqual(updated.matched_segments, 1)
         self.assertIsNotNone(updated.manifest_hash)
+
+    def test_finder_failure_sets_structured_failure_metadata(self) -> None:
+        class BrokenResolver:
+            def resolve(self, source: str) -> tuple[str, list[ManifestRecord]]:
+                del source
+                raise RuntimeError("boom")
+
+        store = InMemoryJobStore()
+        record = store.create_job(
+            CreateJobRequest(
+                source="s3://raw-dashcam-archive/",
+                sink="s3://training-dataset/",
+                find="match",
+                transforms=[TransformSpec(type="video.extract_frames", params={"fps": 1, "format": "jpg"})],
+            )
+        )
+        finder = JobFinder(store, manifest_resolver=BrokenResolver())
+
+        finder.reconcile_once()
+
+        updated = store.get_job(record.id)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.status, JobStatus.FAILED)
+        self.assertEqual(updated.stage, JobStage.FAILED)
+        self.assertEqual(updated.failure_category, JobFailureCategory.PLANNING_ERROR)
+        self.assertEqual(updated.failure_message, "Planner failed while preparing the job")
+        self.assertEqual(updated.events[-1].type, "planner_failed")
 
     def test_finder_initializes_lazily_when_manifest_store_is_not_local(self) -> None:
         prev_manifest_root = os.environ.get("MX8_MANIFEST_STORE_ROOT")

@@ -1,0 +1,123 @@
+---
+title: "API"
+description: "Canonical MX8 job shape and job status fields."
+---
+
+# API
+
+## Canonical request shape
+
+```python
+import mx8
+
+job = mx8.run(
+    input="s3://catalog-images/",
+    work=[
+        mx8.crop(width=1200, height=1200),
+        mx8.resize(width=1024, height=1024, media="image"),
+        mx8.convert(format="webp", quality=85),
+    ],
+    output="s3://catalog-images-web/",
+)
+```
+
+## REST
+
+- `POST /v1/jobs`
+- `GET /v1/jobs`
+- `GET /v1/jobs/{job_id}`
+
+## Job response
+
+`GET /v1/jobs/{job_id}` returns the support-facing fields needed to explain a job from one id.
+
+```json
+{
+  "id": "job_123",
+  "status": "RUNNING",
+  "stage": "RUNNING",
+  "input": "s3://catalog-images/",
+  "output": "s3://catalog-images-web/",
+  "work": [
+    {"type": "image.resize", "params": {"width": 1024, "height": 1024}},
+    {"type": "image.convert", "params": {"format": "webp", "quality": 85}}
+  ],
+  "completed_objects": 8400,
+  "completed_bytes": 2123456789,
+  "outputs_written": 8400,
+  "current_workers": 4,
+  "desired_workers": 4,
+  "worker_pool": "image-default",
+  "region": "us-east-1",
+  "instance_type": "c7i.xlarge",
+  "failure_category": null,
+  "failure_message": null,
+  "events": []
+}
+```
+
+## Meaning of the main fields
+
+- `status`: coarse lifecycle state
+- `stage`: operator-facing phase
+- `outputs_written`: current output count
+- `worker_pool`: assigned pool name
+- `failure_category`: structured failure class
+- `failure_message`: short human-readable failure reason
+- `events`: recent event trail
+
+## Operator CLI
+
+MX8 also ships a small operator CLI for internal support and live operations.
+
+```bash
+mx8 ops watch <job_id>
+mx8 ops live
+```
+
+- `watch` follows one job live
+- `live` shows the active job table across the fleet
+
+Example `watch` output:
+
+```text
+Job: job_123
+Status: FAILED
+Stage: FAILED
+
+Failure:
+- category: worker_error
+- message: worker crashed during image resize
+```
+
+## Workflow-specific examples
+
+### Proxy
+
+```python
+mx8.run(
+    input="s3://raw-video/",
+    work=[mx8.proxy()],
+    output="s3://review-proxies/",
+)
+```
+
+### Remux
+
+```python
+mx8.run(
+    input="s3://incoming-media/",
+    work=[mx8.remux(container="mp4")],
+    output="s3://rewrapped-media/",
+)
+```
+
+## Current stages
+
+- `SUBMITTED`
+- `PLANNING`
+- `PLANNED`
+- `QUEUED`
+- `RUNNING`
+- `COMPLETE`
+- `FAILED`

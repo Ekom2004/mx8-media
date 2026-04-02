@@ -96,6 +96,10 @@ impl ToWire<wire::Transform> for core::TransformSpec {
         use wire::transform::Kind;
 
         let kind = match self {
+            core::TransformSpec::ImageDevelopRaw => Kind::ImageDevelopRaw(wire::ImageDevelopRaw {}),
+            core::TransformSpec::ImageRemoveBackground => {
+                Kind::ImageRemoveBackground(wire::ImageRemoveBackground {})
+            }
             core::TransformSpec::VideoTranscode { codec, crf, preset } => {
                 Kind::VideoTranscode(wire::VideoTranscode {
                     codec: codec.clone(),
@@ -103,6 +107,9 @@ impl ToWire<wire::Transform> for core::TransformSpec {
                     preset: preset.clone().unwrap_or_default(),
                 })
             }
+            core::TransformSpec::VideoRemux { container } => Kind::VideoRemux(wire::VideoRemux {
+                container: container.clone(),
+            }),
             core::TransformSpec::VideoResize {
                 width,
                 height,
@@ -187,6 +194,8 @@ impl TryToCore<core::TransformSpec> for wire::Transform {
             .ok_or(ConvertError::MissingField { field: "kind" })?;
 
         match kind {
+            Kind::ImageDevelopRaw(_) => Ok(core::TransformSpec::ImageDevelopRaw),
+            Kind::ImageRemoveBackground(_) => Ok(core::TransformSpec::ImageRemoveBackground),
             Kind::VideoTranscode(spec) => {
                 non_empty("codec", &spec.codec)?;
                 Ok(core::TransformSpec::VideoTranscode {
@@ -197,6 +206,12 @@ impl TryToCore<core::TransformSpec> for wire::Transform {
                     } else {
                         Some(spec.preset.clone())
                     },
+                })
+            }
+            Kind::VideoRemux(spec) => {
+                non_empty("container", &spec.container)?;
+                Ok(core::TransformSpec::VideoRemux {
+                    container: spec.container.clone(),
                 })
             }
             Kind::VideoResize(spec) => Ok(core::TransformSpec::VideoResize {
@@ -406,10 +421,15 @@ mod tests {
             sink_uri: "s3://sink/output/".to_string(),
             aws_region: "us-east-1".to_string(),
             transforms: vec![
+                core::TransformSpec::ImageDevelopRaw,
+                core::TransformSpec::ImageRemoveBackground,
                 core::TransformSpec::VideoTranscode {
                     codec: "h264".to_string(),
                     crf: 23,
                     preset: Some("veryfast".to_string()),
+                },
+                core::TransformSpec::VideoRemux {
+                    container: "mp4".to_string(),
                 },
                 core::TransformSpec::ImageResize {
                     width: 512,

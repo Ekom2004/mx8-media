@@ -1,0 +1,66 @@
+---
+title: "MX8 Overview"
+description: "Transform massive media datasets without building the systems around them."
+---
+
+# Transform massive media datasets.
+
+MX8 is a batch runtime for image, video, and audio transforms at dataset scale.
+
+Use MX8 when you need to:
+
+- resize, crop, and convert large image sets
+- proxy, remux, transcode, and extract from video
+- extract, resample, and normalize audio
+- run large media jobs without building worker orchestration, retries, or output plumbing yourself
+
+## Canonical shape
+
+```python
+import mx8
+
+job = mx8.run(
+    input="s3://catalog-images/",
+    work=[
+        mx8.crop(width=1200, height=1200),
+        mx8.resize(width=1024, height=1024, media="image"),
+        mx8.convert(format="webp", quality=85),
+    ],
+    output="s3://catalog-images-web/",
+)
+
+job.wait()
+```
+
+## What MX8 owns
+
+MX8 owns the job lifecycle around the transform:
+
+- job submission
+- planning and worker assignment
+- progress tracking
+- failure reporting
+- output materialization
+
+That means a customer can hand you a `job_id` and you can inspect:
+
+- status
+- stage
+- outputs written
+- worker pool
+- failure category
+- failure message
+- recent events
+
+## Current product line
+
+MX8 is currently transform-first.
+
+Supported public workflows center on:
+
+- image processing
+- video processing
+- audio processing
+- supportable batch execution
+
+Selection-oriented workflows like `find(...)` may exist for controlled testing, but they are not the default public promise.

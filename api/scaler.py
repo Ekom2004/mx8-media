@@ -6,7 +6,7 @@ import threading
 from dataclasses import dataclass
 
 from .launcher import CoordinatorLauncher
-from .models import JobProgressUpdate, JobRecord, JobStatus
+from .models import JobFailureCategory, JobProgressUpdate, JobRecord, JobStage, JobStatus
 from .storage import JobStore
 
 # `FINDING` jobs are planner-owned. `PLANNED` remains a transient planner state but
@@ -19,9 +19,11 @@ TRANSFORM_WEIGHTS: dict[str, float] = {
     "image.resize": 1.0,
     "image.crop": 1.0,
     "image.convert": 1.0,
+    "audio.transcode": 4.0,
     "audio.resample": 3.0,
     "audio.normalize": 3.0,
     "video.resize": 6.0,
+    "video.remux": 2.0,
     "video.extract_audio": 8.0,
     "video.transcode": 12.0,
     "video.extract_frames": 16.0,
@@ -31,9 +33,11 @@ PER_OBJECT_OVERHEAD: dict[str, float] = {
     "image.resize": 0.02,
     "image.crop": 0.02,
     "image.convert": 0.02,
+    "audio.transcode": 0.08,
     "audio.resample": 0.05,
     "audio.normalize": 0.05,
     "video.resize": 0.2,
+    "video.remux": 0.05,
     "video.extract_audio": 0.25,
     "video.transcode": 0.3,
     "video.extract_frames": 0.5,
@@ -101,6 +105,7 @@ class JobScaler:
                             job_id=record.id,
                             current_workers=0,
                             desired_workers=0,
+                            worker_pool=self._worker_pool(record),
                         )
                     )
                 continue
@@ -116,13 +121,22 @@ class JobScaler:
                 or record.instance_type != plan.instance_type
             ):
                 updated = self._store.update_job_progress(
-                    JobProgressUpdate(
-                        job_id=record.id,
-                        desired_workers=plan.worker_count,
-                        region=plan.region,
-                        instance_type=plan.instance_type,
+                        JobProgressUpdate(
+                            job_id=record.id,
+                            desired_workers=plan.worker_count,
+                            worker_pool=self._worker_pool(record),
+                            region=plan.region,
+                            instance_type=plan.instance_type,
+                            event_type="worker_plan_updated",
+                            event_message="Scaler updated the worker plan for the job",
+                            event_metadata={
+                                "desired_workers": plan.worker_count,
+                                "region": plan.region,
+                                "instance_type": plan.instance_type,
+                                "worker_pool": self._worker_pool(record),
+                            },
+                        )
                     )
-                )
                 if updated is not None:
                     record = updated
             self._launcher.scale_workers(
@@ -135,7 +149,16 @@ class JobScaler:
 
     def _ensure_launch(self, record: JobRecord, api_base_url: str) -> JobRecord | None:
         if record.status == JobStatus.PENDING:
-            queued = self._store.update_job_status(record.id, JobStatus.QUEUED)
+            queued = self._store.update_job_progress(
+                JobProgressUpdate(
+                    job_id=record.id,
+                    status=JobStatus.QUEUED,
+                    stage=JobStage.QUEUED,
+                    worker_pool=self._worker_pool(record),
+                    event_type="job_queued",
+                    event_message="Job entered the worker queue",
+                )
+            )
             if queued is None:
                 return None
             record = queued
@@ -146,8 +169,14 @@ class JobScaler:
                 JobProgressUpdate(
                     job_id=record.id,
                     status=JobStatus.FAILED,
+                    stage=JobStage.FAILED,
                     current_workers=0,
                     desired_workers=0,
+                    worker_pool=self._worker_pool(record),
+                    failure_category=JobFailureCategory.CAPACITY_ERROR,
+                    failure_message="Scheduler failed to launch workers for the job",
+                    event_type="worker_launch_failed",
+                    event_message="Scheduler failed to launch workers for the job",
                 )
             )
             self._launcher.terminate_job(record.id)
@@ -213,3 +242,12 @@ class JobScaler:
 
     def _max_workers(self) -> int:
         return max(1, int(os.getenv("MX8_SCALE_MAX_WORKERS", "8")))
+
+    def _worker_pool(self, record: JobRecord) -> str:
+        configured = os.getenv("MX8_WORKER_POOL", "").strip()
+        if configured:
+            return configured
+        media_family = self._media_family(record)
+        if self._region(record) == "local":
+            return "local"
+        return f"{media_family}-default"
